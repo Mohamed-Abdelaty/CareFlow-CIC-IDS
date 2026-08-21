@@ -1,0 +1,200 @@
+version: "3.8"
+
+services:
+  # ---------------- Kafka + Zookeeper ----------------
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.6.0
+    container_name: zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    networks: [hpf-net]
+
+  kafka:
+    image: confluentinc/cp-kafka:7.6.0
+    container_name: kafka
+    depends_on: [zookeeper]
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+    networks: [hpf-net]
+
+  # ---------------- HDFS ----------------
+  namenode:
+    image: apache/hadoop:3
+    container_name: namenode
+    hostname: namenode
+    user: root
+    entrypoint: >
+      /bin/bash -c "
+        cp /hadoop-config/* /opt/hadoop/etc/hadoop/ &&
+        if [ ! -f /hadoop/dfs/name/current/VERSION ]; then
+          hdfs namenode -format -force -nonInteractive;
+        fi &&
+        hdfs namenode
+      "
+    ports:
+      - "9870:9870"
+      - "9000:8020"
+    volumes:
+      - hdfs_namenode:/hadoop/dfs/name
+      - ./hadoop-config:/hadoop-config
+    networks: [hpf-net]
+
+  datanode:
+    image: apache/hadoop:3
+    container_name: datanode
+    hostname: datanode
+    user: root
+    entrypoint: >
+      /bin/bash -c "
+        cp /hadoop-config/* /opt/hadoop/etc/hadoop/ &&
+        hdfs datanode
+      "
+    depends_on: [namenode]
+    volumes:
+      - hdfs_datanode:/hadoop/dfs/data
+      - ./hadoop-config:/hadoop-config
+    networks: [hpf-net]
+
+  # ---------------- Spark ----------------
+  spark-master:
+    image: apache/spark:3.5.3
+    container_name: spark-master
+    user: root
+    environment:
+      - SPARK_NO_DAEMONIZE=true
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.master.Master
+    ports:
+      - "8080:8080"
+      - "7077:7077"
+    networks: [hpf-net]
+
+  spark-worker:
+    image: apache/spark:3.5.3
+    container_name: spark-worker
+    user: root
+    depends_on: [spark-master]
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077
+    networks: [hpf-net]
+
+  spark-processor:
+    build: ./spark
+    container_name: spark-processor
+    depends_on: [kafka, spark-master, namenode]
+    volumes:
+      - ./spark/jobs:/opt/jobs
+      - ./data:/data
+    networks: [hpf-net]
+
+  # ---------------- Postgres (metadata + predictions) ----------------
+  postgres:
+    image: postgres:15
+    container_name: postgres
+    environment:
+      POSTGRES_USER: hpf
+      POSTGRES_PASSWORD: hpf_password
+      POSTGRES_DB: hospital_flow
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql
+    networks: [hpf-net]
+
+  # ---------------- Airflow ----------------
+  airflow-init:
+    build: ./airflow
+    container_name: airflow-init
+    depends_on: [postgres]
+    environment:
+      - AIRFLOW__CORE__EXECUTOR=LocalExecutor
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://hpf:hpf_password@postgres/hospital_flow
+    entrypoint: bash -c "airflow db init && airflow users create --username admin --password admin --firstname admin --lastname admin --role Admin --email admin@example.com"
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+    networks: [hpf-net]
+
+  airflow-webserver:
+    build: ./airflow
+    container_name: airflow-webserver
+    depends_on: [airflow-init]
+    environment:
+      - AIRFLOW__CORE__EXECUTOR=LocalExecutor
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://hpf:hpf_password@postgres/hospital_flow
+    ports:
+      - "8081:8080"
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./data:/data
+    command: webserver
+    networks: [hpf-net]
+
+  airflow-scheduler:
+    build: ./airflow
+    container_name: airflow-scheduler
+    depends_on: [airflow-webserver]
+    environment:
+      - AIRFLOW__CORE__EXECUTOR=LocalExecutor
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://hpf:hpf_password@postgres/hospital_flow
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./data:/data
+    command: scheduler
+    networks: [hpf-net]
+
+  # ---------------- Kafka producer ----------------
+  kafka-producer:
+    build: ./kafka/producer
+    container_name: kafka-producer
+    depends_on: [kafka]
+    volumes:
+      - ./data:/data
+    networks: [hpf-net]
+
+  # ---------------- ML training ----------------
+  ml-trainer:
+    build: ./ml
+    container_name: ml-trainer
+    depends_on: [postgres, namenode]
+    environment:
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - ./data:/data
+      - ./ml/models:/models
+    networks: [hpf-net]
+
+  # ---------------- API ----------------
+  api:
+    build: ./api
+    container_name: hpf-api
+    depends_on: [postgres]
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./ml/models:/models
+    networks: [hpf-net]
+
+  # ---------------- Dashboard ----------------
+  dashboard:
+    build: ./dashboard
+    container_name: hpf-dashboard
+    depends_on: [api, postgres]
+    ports:
+      - "8501:8501"
+    networks: [hpf-net]
+
+volumes:
+  hdfs_namenode:
+  hdfs_datanode:
+  pg_data:
+
+networks:
+  hpf-net:
+    driver: bridge
