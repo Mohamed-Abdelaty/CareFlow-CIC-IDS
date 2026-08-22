@@ -88,6 +88,9 @@ services:
     build: ./spark
     container_name: spark-processor
     depends_on: [kafka, spark-master, namenode]
+    environment:
+      - KAFKA_TOPIC=network_flows_stream
+      - HDFS_URI=hdfs://namenode:8020
     volumes:
       - ./spark/jobs:/opt/jobs
       - ./data:/data
@@ -154,6 +157,9 @@ services:
     build: ./kafka/producer
     container_name: kafka-producer
     depends_on: [kafka]
+    environment:
+      - KAFKA_TOPIC=network_flows_stream
+      - SEND_DELAY=0.005
     volumes:
       - ./data:/data
     networks: [hpf-net]

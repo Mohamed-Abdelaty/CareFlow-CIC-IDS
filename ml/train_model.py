@@ -1,200 +1,264 @@
 """
-ML Training script
-Reads processed data (from HDFS Parquet, or a local CSV fallback for quick testing),
-trains:
-  1. A regression model  -> predicted length of stay       (XGBRegressor)
-  2. A classification model -> stay category (Short / Medium / Long) (XGBClassifier)
-and saves both as joblib files under /models.
+ML Trainer — CIC-IDS 2018 Network Intrusion Detection
+Reads processed Parquet files from HDFS, trains an XGBClassifier to
+detect whether a network flow is benign or an attack (binary classification).
 
-Why XGBoost over Random Forest?
-  - Gradient Boosting builds trees sequentially; each tree corrects the errors of the
-    previous one, resulting in significantly higher accuracy on tabular medical data.
-  - XGBoost uses regularisation (L1/L2) to prevent overfitting.
-  - It is faster to train than Random Forest on large datasets when using
-    histogram-based tree building (default in modern XGBoost).
+Design notes:
+  - Problem type  : Binary classification only (no regression target exists)
+  - Class imbalance: IDS-2018 is ~83% Benign / ~17% Attack.
+    Handled via scale_pos_weight = n_benign / n_attack inside XGBoost.
+  - Data leakage  : `dst_port` is kept as a feature but noted as a
+    partial-leakage risk (some attack types consistently target fixed ports).
+    All other leaky columns (raw timestamps, flow IDs) are never included.
+  - Pipeline      : ColumnTransformer wraps a StandardScaler for all
+    numeric features inside a sklearn Pipeline, so scaling is fit only on
+    the training split — never on the full dataset.
+  - Evaluation    : Accuracy, Precision, Recall, F1, and ROC-AUC are all
+    reported on the held-out test set to give an honest performance picture.
 """
 
 import io
 import os
+import warnings
 
 import joblib
+import numpy as np
 import pandas as pd
-import pyarrow.parquet as pq
-from hdfs import InsecureClient
-from sklearn.compose import ColumnTransformer
-from sklearn.metrics import accuracy_score, mean_absolute_error
+import requests
+from sklearn.metrics import (
+    accuracy_score,
+    classification_report,
+    f1_score,
+    precision_score,
+    recall_score,
+    roc_auc_score,
+)
 from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import OrdinalEncoder
-from xgboost import XGBClassifier, XGBRegressor
+from sklearn.preprocessing import StandardScaler
+from xgboost import XGBClassifier
 
-# ── Data sources ───────────────────────────────────────────────────────────────
-# Primary: HDFS (written by Spark after cleaning & feature engineering)
-HDFS_URL       = os.getenv("HDFS_URL", "http://namenode:9870")
-HDFS_PROCESSED = os.getenv("HDFS_PROCESSED_PATH", "/hospital/processed")
+warnings.filterwarnings("ignore")
 
-# Fallback: local CSV (useful for quick dev / testing without a running HDFS)
-CSV_FALLBACK   = os.getenv("PROCESSED_DATA_PATH", "/data/processed/hospital_data.csv")
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+HDFS_NAMENODE   = os.getenv("HDFS_NAMENODE",  "http://namenode:9870")
+PROCESSED_PATH  = "/ids/processed"
+MODELS_DIR      = os.getenv("MODELS_DIR",     "/models")
+CSV_FALLBACK    = os.getenv("CSV_FALLBACK",   "/data/raw")   # first CSV found
 
-MODEL_DIR = os.getenv("MODEL_DIR", "/models")
-
-# ── Feature definitions ────────────────────────────────────────────────────────
-CATEGORICAL_FEATURES = [
-    "age_group",
-    "gender",
-    "admission_type",
-    "diagnosis",
-    "severity",
-    "risk_of_mortality",
+# Features selected for training:
+#   - All numeric, directly measured from the network flow
+#   - NOTE: dst_port is included but flagged as a potential partial-leakage
+#     source (some attack types always hit the same port). The model may
+#     partially memorise port numbers rather than true traffic patterns.
+FEATURES = [
+    "dst_port",           # ⚠ partial leakage risk — see module docstring
+    "protocol",
+    "flow_duration",
+    "tot_fwd_pkts",
+    "tot_bwd_pkts",
+    "totlen_fwd_pkts",
+    "totlen_bwd_pkts",
+    "flow_byts_per_s",
+    "flow_pkts_per_s",
+    "flow_iat_mean",
+    "flow_iat_std",
+    "fwd_psh_flags",
+    "fin_flag_cnt",
+    "syn_flag_cnt",
+    "rst_flag_cnt",
+    "psh_flag_cnt",
+    "ack_flag_cnt",
+    "init_fwd_win_byts",
+    "init_bwd_win_byts",
+    "active_mean",
+    "idle_mean",
 ]
-NUMERIC_FEATURES  = []           # total_charges removed — it is derived from LOS (data leakage)
-TARGET_REGRESSION = "length_of_stay"
-
-# Stay-category label encoding  (XGBClassifier requires integer targets)
-LABEL_MAP     = {"Short": 0, "Medium": 1, "Long": 2}
-INV_LABEL_MAP = {0: "Short", 1: "Medium", 2: "Long"}
+TARGET = "is_attack"   # 0 = Benign, 1 = Attack (binarised by Spark)
 
 
-def categorize_stay(days: float) -> str:
-    """Map a raw number of days to a clinical stay category."""
-    if days <= 3:
-        return "Short"
-    elif days <= 7:
-        return "Medium"
-    return "Long"
-
-
-def build_pipeline(estimator):
-    """
-    Build a sklearn Pipeline with:
-      - OrdinalEncoder for all categorical columns
-        (preferred over OneHotEncoder for tree-based models like XGBoost)
-      - No numeric features (total_charges removed — data leakage)
-    """
-    from sklearn.pipeline import make_pipeline
-    preprocessor = ColumnTransformer(
-        transformers=[
-            (
-                "cat",
-                OrdinalEncoder(handle_unknown="use_encoded_value", unknown_value=-1),
-                CATEGORICAL_FEATURES,
-            ),
-        ],
-        remainder="drop",   # drop any remaining columns (none expected)
+# ---------------------------------------------------------------------------
+# Data loading
+# ---------------------------------------------------------------------------
+def load_from_hdfs() -> pd.DataFrame | None:
+    """Fetch all Parquet files from HDFS /ids/processed via WebHDFS REST API."""
+    list_url = (
+        f"{HDFS_NAMENODE}/webhdfs/v1{PROCESSED_PATH}"
+        "?op=LISTSTATUS"
     )
-    return Pipeline(steps=[("preprocess", preprocessor), ("model", estimator)])
-
-
-# ── Data loading ───────────────────────────────────────────────────────────────
-def load_data() -> pd.DataFrame:
-    """
-    Try to load processed Parquet files from HDFS (the output of Spark's
-    cleaning & feature-engineering pipeline). If HDFS is unreachable, fall
-    back to the local CSV file.
-    """
-    # 1. HDFS — primary source
     try:
-        client = InsecureClient(HDFS_URL, user="root")
-        files = [
-            f for f in client.list(HDFS_PROCESSED, status=False)
-            if f.endswith(".parquet") or f.endswith(".snappy.parquet")
-        ]
-        if files:
-            print(f"Reading {len(files)} Parquet file(s) from HDFS: {HDFS_PROCESSED}")
-            dfs = []
-            for fname in files:
-                path = f"{HDFS_PROCESSED}/{fname}"
-                with client.read(path) as reader:
-                    buf = io.BytesIO(reader.read())
-                    dfs.append(pq.read_table(buf).to_pandas())
-            df = pd.concat(dfs, ignore_index=True)
-            print(f"Loaded {len(df)} rows from HDFS.")
-            return df
-        else:
-            print("No Parquet files found on HDFS yet.")
-    except Exception as e:
-        print(f"Could not read from HDFS ({e}), trying local CSV fallback...")
+        resp = requests.get(list_url, timeout=10)
+        resp.raise_for_status()
+    except Exception as exc:
+        print(f"[trainer] HDFS listing failed: {exc}")
+        return None
 
-    # 2. Local CSV — fallback
-    if os.path.exists(CSV_FALLBACK):
-        print(f"Reading from local CSV: {CSV_FALLBACK}")
-        df = pd.read_csv(CSV_FALLBACK)
-        print(f"Loaded {len(df)} rows from CSV.")
-        return df
+    files = resp.json().get("FileStatuses", {}).get("FileStatus", [])
+    parquet_files = [f for f in files if f["pathSuffix"].endswith(".parquet")]
+    if not parquet_files:
+        print("[trainer] No Parquet files found in HDFS.")
+        return None
 
-    return None
+    print(f"[trainer] Reading {len(parquet_files)} Parquet file(s) from HDFS: {PROCESSED_PATH}")
+    frames = []
+    for pf in parquet_files:
+        path = f"{PROCESSED_PATH}/{pf['pathSuffix']}"
+        url  = f"{HDFS_NAMENODE}/webhdfs/v1{path}?op=OPEN"
+        try:
+            r = requests.get(url, timeout=30, allow_redirects=True)
+            r.raise_for_status()
+            frames.append(pd.read_parquet(io.BytesIO(r.content)))
+        except Exception as exc:
+            print(f"[trainer]   Skipping {pf['pathSuffix']}: {exc}")
+
+    if not frames:
+        return None
+    df = pd.concat(frames, ignore_index=True)
+    print(f"[trainer] Loaded {len(df):,} rows from HDFS.")
+    return df
 
 
-# ── Training ───────────────────────────────────────────────────────────────────
-def main():
-    df = load_data()
-    if df is None:
-        print("No data found — neither HDFS nor local CSV. Skipping training.")
-        return
+def load_from_csv_fallback() -> pd.DataFrame | None:
+    """Read the first CSV in /data/raw as a fallback when HDFS has no data yet."""
+    import glob
+    files = sorted(glob.glob(os.path.join(CSV_FALLBACK, "*.csv")))
+    if not files:
+        print(f"[trainer] No CSV fallback found in {CSV_FALLBACK}.")
+        return None
 
-    os.makedirs(MODEL_DIR, exist_ok=True)
-
-    # Drop rows that are still missing any required column
-    df = df.dropna(subset=CATEGORICAL_FEATURES + NUMERIC_FEATURES + [TARGET_REGRESSION])
-    df[TARGET_REGRESSION] = pd.to_numeric(df[TARGET_REGRESSION], errors="coerce")
-    df = df.dropna(subset=[TARGET_REGRESSION])
-
-    # Derive stay category and encode to integers for XGBClassifier
-    df["stay_category"] = df[TARGET_REGRESSION].apply(categorize_stay)
-
-    features = CATEGORICAL_FEATURES   # total_charges removed (data leakage)
-    X        = df[features]
-    y_reg    = df[TARGET_REGRESSION]
-    y_clf    = df["stay_category"].map(LABEL_MAP)   # "Short"->0, "Medium"->1, "Long"->2
-
-    X_train, X_test, y_reg_train, y_reg_test, y_clf_train, y_clf_test = train_test_split(
-        X, y_reg, y_clf, test_size=0.2, random_state=42
-    )
-
-    # ── Task 1: Regression — predict exact length of stay ──────────────────────
-    print("Training XGBRegressor ...")
-    reg_pipeline = build_pipeline(
-        XGBRegressor(
-            n_estimators=300,       # number of boosting rounds
-            max_depth=6,            # tree depth — controls model complexity
-            learning_rate=0.1,      # step-size shrinkage to prevent overfitting
-            subsample=0.8,          # fraction of training samples used per tree
-            colsample_bytree=0.8,   # fraction of features sampled per tree
-            random_state=42,
-            n_jobs=-1,              # use all available CPU cores
-            verbosity=0,
+    filepath = files[0]
+    print(f"[trainer] CSV fallback: {filepath}")
+    chunks = []
+    for chunk in pd.read_csv(filepath, chunksize=100_000, low_memory=False,
+                              encoding="utf-8", on_bad_lines="skip"):
+        # Normalise column names (same logic as producer)
+        chunk.columns = (
+            chunk.columns
+            .str.strip()
+            .str.lower()
+            .str.replace(r"/s$", "_per_s", regex=True)
+            .str.replace("/", "_per_", regex=False)
+            .str.replace(" ", "_", regex=False)
+            .str.replace(".", "", regex=False)
         )
-    )
-    reg_pipeline.fit(X_train, y_reg_train)
-    reg_preds = reg_pipeline.predict(X_test)
-    mae = mean_absolute_error(y_reg_test, reg_preds)
-    print(f"Regression MAE: {mae:.2f} days")
+        # Remove repeated-header rows
+        if "label" in chunk.columns:
+            chunk = chunk[chunk["label"].str.lower() != "label"]
+        chunks.append(chunk)
 
-    # ── Task 2: Classification — predict stay category ─────────────────────────
-    print("Training XGBClassifier ...")
-    clf_pipeline = build_pipeline(
-        XGBClassifier(
+    df = pd.concat(chunks, ignore_index=True)
+    # Binarise label in fallback
+    if "label" in df.columns:
+        df[TARGET] = (df["label"].str.strip().str.lower() != "benign").astype(int)
+    print(f"[trainer] CSV fallback loaded {len(df):,} rows.")
+    return df
+
+
+# ---------------------------------------------------------------------------
+# Training
+# ---------------------------------------------------------------------------
+def train(df: pd.DataFrame) -> None:
+    os.makedirs(MODELS_DIR, exist_ok=True)
+
+    # Ensure required columns are present
+    missing = [c for c in FEATURES + [TARGET] if c not in df.columns]
+    if missing:
+        raise ValueError(f"Missing columns: {missing}")
+
+    # Convert features and target to numeric, replace inf/-inf with NaN, drop bad rows
+    X = df[FEATURES].apply(pd.to_numeric, errors="coerce")
+    y = pd.to_numeric(df[TARGET], errors="coerce")
+
+    # Replace Infinity values (common in IDS-2018: flow_byts_per_s = bytes/0)
+    X = X.replace([np.inf, -np.inf], np.nan)
+
+    valid = X.notna().all(axis=1) & y.notna()
+    X, y = X[valid], y[valid].astype(int)
+    print(f"[trainer] Training on {len(X):,} clean rows.")
+
+    # Class distribution
+    n_benign = int((y == 0).sum())
+    n_attack = int((y == 1).sum())
+    print(f"[trainer] Class balance — Benign: {n_benign:,}  Attack: {n_attack:,}")
+
+    if n_attack == 0:
+        raise ValueError("No attack samples found — cannot train a binary classifier.")
+
+    scale_pos_weight = n_benign / n_attack
+    print(f"[trainer] scale_pos_weight = {scale_pos_weight:.2f}")
+
+    # Stratified train/test split to preserve class ratio
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, random_state=42, stratify=y
+    )
+
+    # Build sklearn Pipeline (scaler + XGBClassifier)
+    # StandardScaler is fit ONLY on training data inside the pipeline.
+    pipeline = Pipeline([
+        ("scaler", StandardScaler()),
+        ("clf", XGBClassifier(
             n_estimators=300,
             max_depth=6,
             learning_rate=0.1,
-            subsample=0.8,
-            colsample_bytree=0.8,
+            scale_pos_weight=scale_pos_weight,   # compensate imbalance
+            eval_metric="logloss",
             random_state=42,
             n_jobs=-1,
-            verbosity=0,
-            eval_metric="mlogloss",  # multi-class log loss evaluation metric
-        )
-    )
-    clf_pipeline.fit(X_train, y_clf_train)
-    clf_preds = clf_pipeline.predict(X_test)
-    acc = accuracy_score(y_clf_test, clf_preds)
-    print(f"Classification accuracy: {acc:.2%}")
+        )),
+    ])
 
-    # ── Save models & inverse label map ───────────────────────────────────────
-    joblib.dump(reg_pipeline,  os.path.join(MODEL_DIR, "los_regressor.joblib"))
-    joblib.dump(clf_pipeline,  os.path.join(MODEL_DIR, "stay_classifier.joblib"))
-    joblib.dump(INV_LABEL_MAP, os.path.join(MODEL_DIR, "label_map.joblib"))
-    print(f"Models saved to {MODEL_DIR}")
+    print("[trainer] Training XGBClassifier ...")
+    pipeline.fit(X_train, y_train)
+
+    # Evaluate on the held-out test set
+    y_pred      = pipeline.predict(X_test)
+    y_prob      = pipeline.predict_proba(X_test)[:, 1]
+
+    accuracy    = accuracy_score(y_test, y_pred)
+    precision   = precision_score(y_test, y_pred, zero_division=0)
+    recall      = recall_score(y_test, y_pred, zero_division=0)
+    f1          = f1_score(y_test, y_pred, zero_division=0)
+    auc         = roc_auc_score(y_test, y_prob)
+
+    print("─" * 50)
+    print(f"  Accuracy  : {accuracy  * 100:.2f}%")
+    print(f"  Precision : {precision * 100:.2f}%")
+    print(f"  Recall    : {recall    * 100:.2f}%")
+    print(f"  F1 Score  : {f1        * 100:.2f}%")
+    print(f"  ROC-AUC   : {auc       * 100:.2f}%")
+    print("─" * 50)
+    print(classification_report(y_test, y_pred,
+                                target_names=["Benign", "Attack"]))
+
+    # Persist model and metadata
+    joblib.dump(pipeline,                            f"{MODELS_DIR}/ids_classifier.joblib")
+    joblib.dump({"features": FEATURES, "target": TARGET},
+                                                     f"{MODELS_DIR}/model_meta.joblib")
+    joblib.dump({"accuracy": accuracy, "precision": precision,
+                 "recall": recall, "f1": f1, "auc": auc,
+                 "n_train": len(X_train), "n_test": len(X_test),
+                 "n_benign": n_benign, "n_attack": n_attack},
+                                                     f"{MODELS_DIR}/metrics.joblib")
+
+    print(f"[trainer] Models saved to {MODELS_DIR}", flush=True)
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+def main():
+    df = load_from_hdfs()
+    if df is None or len(df) < 100:
+        print("[trainer] HDFS data insufficient — using CSV fallback.")
+        df = load_from_csv_fallback()
+
+    if df is None or len(df) < 100:
+        print("[trainer] No usable data found. Exiting.")
+        return
+
+    train(df)
 
 
 if __name__ == "__main__":

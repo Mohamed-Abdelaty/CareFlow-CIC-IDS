@@ -1,11 +1,11 @@
 """
-Airflow DAG: orchestrates the hospital patient flow pipeline.
+Airflow DAG: orchestrates the IDS network flow pipeline.
 
 Stages:
 1. trigger_kafka_producer  -> kicks off streaming ingestion
 2. wait_for_spark_processing -> waits for Spark to finish writing to HDFS
 3. train_model            -> retrains/evaluates the ML model
-4. refresh_hospital_metrics -> recomputes aggregate metrics into Postgres
+4. refresh_traffic_metrics -> recomputes aggregate traffic metrics into Postgres
 """
 
 from datetime import datetime, timedelta
@@ -15,19 +15,19 @@ from airflow.operators.bash import BashOperator
 from airflow.operators.python import PythonOperator
 
 default_args = {
-    "owner": "hospital-patient-flow",
+    "owner": "careflow-ids",
     "retries": 1,
     "retry_delay": timedelta(minutes=2),
 }
 
 with DAG(
-    dag_id="hospital_patient_flow_pipeline",
+    dag_id="ids_network_flow_pipeline",
     default_args=default_args,
     description="End-to-end pipeline: Kafka -> Spark -> HDFS -> ML -> Postgres",
     schedule_interval="@daily",
     start_date=datetime(2025, 1, 1),
     catchup=False,
-    tags=["hospital", "big-data", "ml"],
+    tags=["ids", "security", "big-data", "ml"],
 ) as dag:
 
     trigger_kafka_producer = BashOperator(
@@ -50,16 +50,25 @@ with DAG(
         python_callable=train_model_task,
     )
 
-    refresh_hospital_metrics = BashOperator(
-        task_id="refresh_hospital_metrics",
+    refresh_traffic_metrics = BashOperator(
+        task_id="refresh_traffic_metrics",
         bash_command=(
             "psql postgresql://hpf:hpf_password@postgres/hospital_flow -c "
-            "\"INSERT INTO hospital_metrics (hospital_county, avg_los, patient_count, long_stay_rate, emergency_rate) "
-            "SELECT hospital_county, AVG(length_of_stay), COUNT(*), "
-            "AVG(CASE WHEN length_of_stay >= 8 THEN 1 ELSE 0 END), "
-            "AVG(CASE WHEN admission_type = 'Emergency' THEN 1 ELSE 0 END) "
-            "FROM patients GROUP BY hospital_county;\""
+            "\"TRUNCATE TABLE traffic_metrics; "
+            "INSERT INTO traffic_metrics (protocol, total_flows, attack_count, benign_count, attack_rate) "
+            "SELECT f.protocol, COUNT(*), "
+            "SUM(CASE WHEN p.is_attack = true THEN 1 ELSE 0 END), "
+            "SUM(CASE WHEN p.is_attack = false THEN 1 ELSE 0 END), "
+            "AVG(CASE WHEN p.is_attack = true THEN 1.0 ELSE 0.0 END) "
+            "FROM network_flows f "
+            "LEFT JOIN LATERAL ( "
+            "    SELECT is_attack FROM predictions "
+            "    WHERE flow_id = f.flow_id "
+            "    ORDER BY predicted_at DESC LIMIT 1 "
+            ") p ON true "
+            "GROUP BY f.protocol;\""
         ),
     )
 
-    trigger_kafka_producer >> wait_for_spark_processing >> train_model >> refresh_hospital_metrics
+    trigger_kafka_producer >> wait_for_spark_processing >> train_model >> refresh_traffic_metrics
+

@@ -1,142 +1,190 @@
 """
-Spark Structured Streaming job
-- Reads from Kafka topic 'patients_stream'
-- Applies enhanced cleaning + feature engineering:
-    1. Drops rows with missing critical fields
-    2. Fills missing severity with 'Unknown'
-    3. Casts numeric fields to Double
-    4. Filters out logically impossible values (Outlier Removal)
-    5. Normalizes text fields (lowercase + trim)
-    6. Groups diagnosis into high-level medical categories
-- Writes raw and processed data to HDFS as Parquet
+Spark Structured Streaming job — CIC-IDS 2018 Network Intrusion Detection
+Reads network-flow JSON messages from Kafka, applies a multi-step cleaning
+pipeline, writes raw and processed Parquet datasets to HDFS.
+
+Cleaning pipeline:
+  1. Parse JSON payload into typed columns
+  2. Drop rows missing any critical numeric field
+  3. Cast all feature columns to DoubleType
+  4. Filter physically impossible values (negative durations, bytes, etc.)
+  5. Drop rows where flow_byts_per_s or flow_pkts_per_s is null
+     (result of Infinity in source CSV — division-by-zero in CICFlowMeter)
+  6. Binarise the label: 'Benign' -> 0, any attack -> 1
+
+NOTE on Dst Port (dst_port):
+  Kept as a feature, but it is a known partial-leakage risk in IDS-2018 —
+  certain attack types (e.g. DoS GoldenEye) consistently target specific
+  ports, so the model may memorise port numbers rather than learning
+  true traffic patterns.  This limitation is documented here for awareness.
 """
 
 import os
 
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, from_json, lower, trim, when
-from pyspark.sql.types import StringType, StructField, StructType
-
-KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP", "kafka:29092")
-TOPIC = os.getenv("KAFKA_TOPIC", "patients_stream")
-HDFS_URI = os.getenv("HDFS_URI", "hdfs://namenode:8020")
-RAW_PATH = f"{HDFS_URI}/hospital/raw"
-PROCESSED_PATH = f"{HDFS_URI}/hospital/processed"
-CHECKPOINT_PATH = f"{HDFS_URI}/hospital/checkpoints"
-
-PATIENT_SCHEMA = StructType(
-    [
-        StructField("age_group", StringType(), True),
-        StructField("gender", StringType(), True),
-        StructField("admission_type", StringType(), True),
-        StructField("diagnosis", StringType(), True),
-        StructField("severity", StringType(), True),
-        StructField("risk_of_mortality", StringType(), True),
-        StructField("length_of_stay", StringType(), True),
-        StructField("total_charges", StringType(), True),
-        StructField("hospital_county", StringType(), True),
-    ]
+from pyspark.sql.functions import (
+    col,
+    from_json,
+    lower,
+    trim,
+    when,
+)
+from pyspark.sql.types import (
+    DoubleType,
+    LongType,
+    StringType,
+    StructField,
+    StructType,
 )
 
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP", "kafka:29092")
+TOPIC           = os.getenv("KAFKA_TOPIC",     "network_flows_stream")
+HDFS_URI        = os.getenv("HDFS_URI",        "hdfs://namenode:8020")
+RAW_PATH        = f"{HDFS_URI}/ids/raw"
+PROCESSED_PATH  = f"{HDFS_URI}/ids/processed"
+CHECKPOINT_PATH = f"{HDFS_URI}/ids/checkpoints"
 
-def build_spark():
-    return (
-        SparkSession.builder.appName("HospitalPatientFlowStreaming")
-        .config(
-            "spark.jars.packages",
-            "org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0",
-        )
-        .config("spark.hadoop.fs.defaultFS", HDFS_URI)
-        .getOrCreate()
+# All columns sent by the producer (string-typed from CSV origin).
+# We declare them all as StringType first, then cast the numeric ones.
+SCHEMA = StructType([
+    StructField("dst_port",           StringType(), True),
+    StructField("protocol",           StringType(), True),
+    StructField("flow_duration",      StringType(), True),
+    StructField("tot_fwd_pkts",       StringType(), True),
+    StructField("tot_bwd_pkts",       StringType(), True),
+    StructField("totlen_fwd_pkts",    StringType(), True),
+    StructField("totlen_bwd_pkts",    StringType(), True),
+    StructField("flow_byts_per_s",    StringType(), True),
+    StructField("flow_pkts_per_s",    StringType(), True),
+    StructField("flow_iat_mean",      StringType(), True),
+    StructField("flow_iat_std",       StringType(), True),
+    StructField("fwd_psh_flags",      StringType(), True),
+    StructField("fin_flag_cnt",       StringType(), True),
+    StructField("syn_flag_cnt",       StringType(), True),
+    StructField("rst_flag_cnt",       StringType(), True),
+    StructField("psh_flag_cnt",       StringType(), True),
+    StructField("ack_flag_cnt",       StringType(), True),
+    StructField("init_fwd_win_byts",  StringType(), True),
+    StructField("init_bwd_win_byts",  StringType(), True),
+    StructField("active_mean",        StringType(), True),
+    StructField("idle_mean",          StringType(), True),
+    StructField("label",              StringType(), True),
+])
+
+# Columns to cast to Double (all numeric features + target before binarisation)
+NUMERIC_COLS = [
+    "dst_port", "protocol", "flow_duration", "tot_fwd_pkts", "tot_bwd_pkts",
+    "totlen_fwd_pkts", "totlen_bwd_pkts", "flow_byts_per_s", "flow_pkts_per_s",
+    "flow_iat_mean", "flow_iat_std", "fwd_psh_flags", "fin_flag_cnt",
+    "syn_flag_cnt", "rst_flag_cnt", "psh_flag_cnt", "ack_flag_cnt",
+    "init_fwd_win_byts", "init_bwd_win_byts", "active_mean", "idle_mean",
+]
+
+# Critical fields — rows missing any of these are dropped
+CRITICAL_COLS = [
+    "flow_duration", "tot_fwd_pkts", "tot_bwd_pkts",
+    "flow_byts_per_s", "flow_pkts_per_s", "label",
+]
+
+
+# ---------------------------------------------------------------------------
+# Streaming processing function
+# ---------------------------------------------------------------------------
+def process_batch(batch_df, batch_id):
+    if batch_df.isEmpty():
+        return
+
+    # ── Step 1: Parse JSON ──────────────────────────────────────────────────
+    parsed = (
+        batch_df
+        .select(from_json(col("value").cast("string"), SCHEMA).alias("d"))
+        .select("d.*")
+    )
+
+    # ── Step 2: Write raw records to HDFS ───────────────────────────────────
+    (
+        parsed.write
+        .mode("append")
+        .parquet(RAW_PATH)
+    )
+
+    # ── Step 3: Normalise label text ────────────────────────────────────────
+    cleaned = parsed.withColumn("label", trim(lower(col("label"))))
+
+    # ── Step 4: Drop rows missing critical fields ────────────────────────────
+    cleaned = cleaned.dropna(subset=CRITICAL_COLS)
+
+    # ── Step 5: Cast all numeric columns to Double ──────────────────────────
+    for c in NUMERIC_COLS:
+        cleaned = cleaned.withColumn(c, col(c).cast(DoubleType()))
+
+    # ── Step 6: Filter physically impossible / Infinity-derived values ───────
+    # Infinity in flow_byts_per_s / flow_pkts_per_s comes from
+    # CICFlowMeter dividing by zero when flow_duration == 0.
+    # Negative duration or packet counts are also impossible.
+    cleaned = cleaned.filter(
+        (col("flow_duration")   >= 0) &
+        (col("tot_fwd_pkts")    >= 0) &
+        (col("tot_bwd_pkts")    >= 0) &
+        (col("flow_byts_per_s").isNotNull()) &
+        (col("flow_pkts_per_s").isNotNull()) &
+        (col("flow_byts_per_s") >= 0) &
+        (col("flow_pkts_per_s") >= 0)
+    )
+
+    # ── Step 7: Binarise label → 0 = Benign, 1 = Attack ────────────────────
+    cleaned = cleaned.withColumn(
+        "is_attack",
+        when(col("label") == "benign", 0).otherwise(1).cast(LongType()),
+    )
+
+    # ── Step 8: Write cleaned, processed records to HDFS ───────────────────
+    (
+        cleaned.write
+        .mode("append")
+        .parquet(PROCESSED_PATH)
+    )
+
+    print(
+        f"[spark] Batch {batch_id}: "
+        f"{cleaned.count()} processed rows written to HDFS.",
+        flush=True,
     )
 
 
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 def main():
-    spark = build_spark()
+    spark = (
+        SparkSession.builder
+        .appName("IDS-NetworkFlow-StreamProcessor")
+        .config("spark.sql.shuffle.partitions", "4")
+        .getOrCreate()
+    )
     spark.sparkContext.setLogLevel("WARN")
 
     raw_stream = (
-        spark.readStream.format("kafka")
+        spark.readStream
+        .format("kafka")
         .option("kafka.bootstrap.servers", KAFKA_BOOTSTRAP)
         .option("subscribe", TOPIC)
         .option("startingOffsets", "earliest")
+        .option("failOnDataLoss", "false")
         .load()
     )
 
-    parsed = raw_stream.select(
-        from_json(col("value").cast("string"), PATIENT_SCHEMA).alias("data")
-    ).select("data.*")
-
-    # ---- Step 1: Drop rows missing critical fields ----
-    cleaned = parsed.dropna(subset=["age_group", "admission_type"])
-
-    # ---- Step 2: Fill missing severity with 'Unknown' ----
-    cleaned = cleaned.withColumn(
-        "severity",
-        when(col("severity").isNull(), "Unknown").otherwise(col("severity")),
-    )
-
-    # ---- Step 3: Cast numeric fields ----
-    cleaned = (
-        cleaned
-        .withColumn("length_of_stay", col("length_of_stay").cast("double"))
-        .withColumn("total_charges", col("total_charges").cast("double"))
-    )
-
-    # ---- Step 4: Outlier Removal — filter out logically impossible values ----
-    # A patient cannot have zero or negative stay days or negative charges
-    cleaned = cleaned.filter(
-        (col("length_of_stay") > 0) &
-        (col("length_of_stay") < 365) &   # max 1 year stay
-        (col("total_charges") > 0) &
-        (col("total_charges") < 10_000_000)  # max $10M charge
-    )
-
-    # ---- Step 5: Text Normalization — lowercase + trim whitespace ----
-    text_cols = ["gender", "admission_type", "severity", "risk_of_mortality", "age_group"]
-    for c in text_cols:
-        cleaned = cleaned.withColumn(c, lower(trim(col(c))))
-
-    # ---- Step 6: Diagnosis Grouping — map hundreds of diagnoses into major categories ----
-    diag = lower(col("diagnosis"))
-    cleaned = cleaned.withColumn(
-        "diagnosis",
-        when(diag.contains("heart") | diag.contains("cardiac") | diag.contains("coronary") | diag.contains("cardio"), "Cardiology")
-        .when(diag.contains("pneumonia") | diag.contains("asthma") | diag.contains("respiratory") | diag.contains("lung") | diag.contains("bronch"), "Respiratory")
-        .when(diag.contains("diabetes") | diag.contains("obesity") | diag.contains("endocrine") | diag.contains("thyroid"), "Endocrine & Metabolic")
-        .when(diag.contains("hip") | diag.contains("knee") | diag.contains("fracture") | diag.contains("joint") | diag.contains("spine") | diag.contains("bone"), "Musculoskeletal")
-        .when(diag.contains("kidney") | diag.contains("renal") | diag.contains("urinary") | diag.contains("bladder"), "Renal & Urinary")
-        .when(diag.contains("cancer") | diag.contains("tumor") | diag.contains("lymphoma") | diag.contains("leukemia") | diag.contains("neoplasm"), "Oncology")
-        .when(diag.contains("stroke") | diag.contains("neuro") | diag.contains("brain") | diag.contains("seizure") | diag.contains("epilep"), "Neurology")
-        .when(diag.contains("depress") | diag.contains("anxiety") | diag.contains("psych") | diag.contains("schizo") | diag.contains("bipolar"), "Mental Health")
-        .when(diag.contains("septic") | diag.contains("infection") | diag.contains("bacteria") | diag.contains("viral") | diag.contains("infect"), "Infectious Disease")
-        .when(diag.contains("gastr") | diag.contains("intestin") | diag.contains("colon") | diag.contains("liver") | diag.contains("bowel") | diag.contains("digest"), "Gastroenterology")
-        .when(diag.contains("newborn") | diag.contains("neonat") | diag.contains("prematurity") | diag.contains("infant"), "Neonatal")
-        .when(diag.contains("pregnan") | diag.contains("delivery") | diag.contains("obstetric") | diag.contains("maternal"), "Obstetrics")
-        .otherwise("Other")
-    )
-
-    # ---- Write raw stream to HDFS ----
-    raw_query = (
-        raw_stream.selectExpr("CAST(value AS STRING)")
-        .writeStream.format("parquet")
-        .option("path", RAW_PATH)
-        .option("checkpointLocation", f"{CHECKPOINT_PATH}/raw")
-        .outputMode("append")
-        .start()
-    )
-
-    # ---- Write cleaned + enriched stream to HDFS ----
-    processed_query = (
-        cleaned.writeStream.format("parquet")
-        .option("path", PROCESSED_PATH)
+    (
+        raw_stream.writeStream
+        .foreachBatch(process_batch)
         .option("checkpointLocation", f"{CHECKPOINT_PATH}/processed")
-        .outputMode("append")
+        .trigger(processingTime="15 seconds")
         .start()
+        .awaitTermination()
     )
-
-    raw_query.awaitTermination()
-    processed_query.awaitTermination()
 
 
 if __name__ == "__main__":
