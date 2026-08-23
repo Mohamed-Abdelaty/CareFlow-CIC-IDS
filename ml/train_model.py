@@ -58,13 +58,24 @@ MODELS_DIR      = os.getenv("MODELS_DIR",     "/models")
 # Training only reads from HDFS — no CSV fallback.
 # Run Spark streaming first to populate HDFS before training.
 
-# Features selected for training:
-#   - All numeric, directly measured from the network flow
-#   - NOTE: dst_port is included but flagged as a potential partial-leakage
-#     source (some attack types always hit the same port). The model may
-#     partially memorise port numbers rather than true traffic patterns.
+# Features selected for training.
+#
+# dst_port REMOVED — diagnostic investigation (2026-08-23) showed that
+#   in the small initial HDFS batch (10K rows, 96 Benign vs 9,950 Attack)
+#   XGBoost used flow_duration as the ONLY split (100% importance) because
+#   the class imbalance was extreme enough that a single-feature threshold
+#   trivially separated the classes.  dst_port was not the primary cause
+#   of the 100%, but it IS a known partial-leakage feature (some attack
+#   types consistently target fixed ports, letting the model memorise port
+#   numbers rather than learning real traffic patterns).  It is therefore
+#   excluded by default to produce more generalisable model weights.
+#
+# label EXCLUDED — the raw label string ("benign", "ddos attack-hoic", …)
+#   is written by Spark to the Parquet schema but is NOT included here.
+#   Including it would be perfect target leakage (directly correlated with
+#   is_attack). The check is enforced by asserting it is absent from the
+#   feature list and never passed to the model.
 FEATURES = [
-    "dst_port",           # ⚠ partial leakage risk — see module docstring
     "protocol",
     "flow_duration",
     "tot_fwd_pkts",
@@ -87,6 +98,11 @@ FEATURES = [
     "idle_mean",
 ]
 TARGET = "is_attack"   # 0 = Benign, 1 = Attack (binarised by Spark)
+
+# Safety assertion — ensure no leakage columns slipped into FEATURES
+_LEAKAGE_COLS = {"label", "dst_port", "src_port", "src_ip", "dst_ip", "timestamp", "flow_id"}
+assert not (_LEAKAGE_COLS & set(FEATURES)), \
+    f"Leakage column(s) detected in FEATURES: {_LEAKAGE_COLS & set(FEATURES)}"
 
 
 # ---------------------------------------------------------------------------
@@ -235,6 +251,31 @@ def train(df: pd.DataFrame) -> None:
     missing = [c for c in FEATURES + [TARGET] if c not in df.columns]
     if missing:
         raise ValueError(f"Missing columns: {missing}")
+
+    # Guard: label string must not be present in df columns used for training.
+    # Its presence in HDFS Parquet was confirmed by the 2026-08-23 diagnostic —
+    # Spark was writing the raw label string alongside is_attack.  It is now
+    # dropped by Spark, but this check ensures nothing slips through.
+    if "label" in df.columns:
+        print("[trainer] WARNING: 'label' column found in HDFS data — dropping it "
+              "to prevent target leakage.", flush=True)
+        df = df.drop(columns=["label"])
+
+    # Deduplicate BEFORE the train/test split.
+    # Spark micro-batch streaming (mode='append') can write the same Kafka
+    # offsets to HDFS multiple times across trigger intervals.  If duplicates
+    # span the split boundary the model memorises exact rows from the training
+    # set and trivially recognises them in the test set, producing 100% metrics.
+    n_before = len(df)
+    df = df.drop_duplicates()
+    n_after  = len(df)
+    n_dropped = n_before - n_after
+    if n_dropped:
+        print(f"[trainer] Removed {n_dropped:,} duplicate rows before split "
+              f"({n_dropped/n_before*100:.1f}% of total).", flush=True)
+
+    if len(df) < 100:
+        raise ValueError("Too few unique rows after deduplication — collect more data first.")
 
     # Convert features and target to numeric, replace inf/-inf with NaN, drop bad rows
     X = df[FEATURES].apply(pd.to_numeric, errors="coerce")

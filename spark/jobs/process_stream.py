@@ -141,16 +141,33 @@ def process_batch(batch_df, batch_id):
         when(col("label") == "benign", 0).otherwise(1).cast(LongType()),
     )
 
-    # ── Step 8: Write cleaned, processed records to HDFS ───────────────────
+    # ── Step 8: Drop the raw label string — it must NOT appear in the
+    #   processed output. Keeping it would be a direct target-leakage
+    #   column (the string "benign" / attack-type name is perfectly
+    #   correlated with is_attack and would trivially give 100% accuracy
+    #   if it ever slipped into a feature set).
+    # ── Step 9: Deduplicate within the batch before writing.
+    #   Spark micro-batch streaming uses mode("append"), so the same
+    #   Kafka offsets can be re-processed across trigger intervals
+    #   (e.g. on restart or backfill). Without deduplication, identical
+    #   rows accumulate in HDFS and can appear in BOTH train and test
+    #   splits, letting the model memorise exact rows and report 100%.
+    processed = (
+        cleaned
+        .drop("label")
+        .dropDuplicates()
+    )
+
+    # ── Step 10: Write cleaned, deduplicated records to HDFS ────────────────
     (
-        cleaned.write
+        processed.write
         .mode("append")
         .parquet(PROCESSED_PATH)
     )
 
     print(
         f"[spark] Batch {batch_id}: "
-        f"{cleaned.count()} processed rows written to HDFS.",
+        f"{processed.count()} processed rows written to HDFS.",
         flush=True,
     )
 
