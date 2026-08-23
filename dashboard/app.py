@@ -13,6 +13,7 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
+from streamlit_autorefresh import st_autorefresh
 
 API_URL = "http://api:8000"
 
@@ -64,7 +65,12 @@ def api_put(path: str, payload: dict):
 # ---------------------------------------------------------------------------
 # Tabs
 # ---------------------------------------------------------------------------
-tab1, tab2, tab3 = st.tabs(["📊 Overview", "🔍 Analyse Flow", "✏️ Edit Flow"])
+tab1, tab2, tab3, tab4 = st.tabs([
+    "📊 Overview", 
+    "🔍 Analyse Flow", 
+    "✏️ Edit Flow", 
+    "🛠️ Model & Pipeline Health"
+])
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -316,3 +322,282 @@ with tab3:
                 else:
                     st.success(f"### {verdict}")
                 st.metric("Updated Attack Confidence", f"{confidence*100:.2f}%")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TAB 4 — Model & Pipeline Health
+# ═══════════════════════════════════════════════════════════════════════════
+with tab4:
+    # ── Auto-refresh: updates the dashboard every 5 seconds for live demos ──
+    st_autorefresh(interval=5000, key="ops_dashboard_autorefresh")
+
+    st.subheader("🛠️ Pipeline Health & Ops Control Panel")
+    st.caption("Live health checks, data ingestion metrics, and training validation statistics")
+
+    # Fetch status and statistics from API
+    status_data = api_get("/status")
+    stats_data  = api_get("/stats")
+
+    if not status_data or not stats_data:
+        st.warning("⚠️ Waiting for connection to FastAPI serving layer...")
+    else:
+        # ───────────────────────────────────────────────────────────────────
+        # 1. Component Status Strip
+        # ───────────────────────────────────────────────────────────────────
+        st.markdown("### 🖥️ Component Status")
+        col_ka, col_sp, col_hd, col_ai, col_ml = st.columns(5)
+
+        def make_status_card(col, name, state):
+            if state == "healthy":
+                color = "#2ecc71"
+                text  = "HEALTHY"
+            elif state == "degraded":
+                color = "#f1c40f"
+                text  = "DEGRADED"
+            else:
+                color = "#e74c3c"
+                text  = "UNHEALTHY"
+
+            col.markdown(
+                f"""
+                <div style="
+                    background-color: #1e1e2e;
+                    padding: 15px;
+                    border-radius: 8px;
+                    border-left: 5px solid {color};
+                    text-align: center;
+                    margin-bottom: 20px;
+                ">
+                    <span style="color: #a6adc8; font-size: 12px; font-weight: bold; text-transform: uppercase;">{name}</span>
+                    <h3 style="color: {color}; margin: 5px 0 0 0; font-size: 18px; font-weight: 800;">{text}</h3>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+        make_status_card(col_ka, "Apache Kafka",    status_data.get("kafka", "unhealthy"))
+        make_status_card(col_sp, "Apache Spark",    status_data.get("spark", "unhealthy"))
+        make_status_card(col_hd, "Hadoop HDFS",     status_data.get("hdfs", "unhealthy"))
+        make_status_card(col_ai, "Apache Airflow",  status_data.get("airflow", "unhealthy"))
+        make_status_card(col_ml, "XGBoost Model",   status_data.get("model", "unhealthy"))
+
+        # ───────────────────────────────────────────────────────────────────
+        # 2. Model Status & Metadata Card
+        # ───────────────────────────────────────────────────────────────────
+        st.divider()
+        m_meta = stats_data.get("model_metadata")
+
+        c_left, c_right = st.columns(2)
+
+        with c_left:
+            st.markdown("### 🧠 Active Model Status")
+            if not m_meta:
+                st.info("No trained model metadata found. Run the training script first.")
+            else:
+                st.markdown(
+                    f"""
+                    <div style="background-color: #1e1e2e; padding: 20px; border-radius: 8px; border: 1px solid #44475a;">
+                        <table style="width: 100%; border-collapse: collapse;">
+                            <tr>
+                                <td style="padding: 8px 0; color: #a6adc8; font-weight: bold;">Model Version</td>
+                                <td style="padding: 8px 0; text-align: right; color: #50fa7b; font-family: monospace;">{m_meta.get('model_version', 'N/A')}</td>
+                            </tr>
+                            <tr>
+                                <td style="padding: 8px 0; color: #a6adc8; font-weight: bold;">Last Trained</td>
+                                <td style="padding: 8px 0; text-align: right; color: #f8f8f2;">{m_meta.get('trained_at', 'N/A')}</td>
+                            </tr>
+                            <tr>
+                                <td style="padding: 8px 0; color: #a6adc8; font-weight: bold;">Training Duration</td>
+                                <td style="padding: 8px 0; text-align: right; color: #f8f8f2;">{m_meta.get('training_duration_sec', 'N/A')} seconds</td>
+                            </tr>
+                            <tr>
+                                <td style="padding: 8px 0; color: #a6adc8; font-weight: bold;">HDFS Input Path</td>
+                                <td style="padding: 8px 0; text-align: right; color: #8be9fd; font-family: monospace;">{m_meta.get('hdfs_path', 'N/A')}</td>
+                            </tr>
+                            <tr>
+                                <td style="padding: 8px 0; color: #a6adc8; font-weight: bold;">Training Samples</td>
+                                <td style="padding: 8px 0; text-align: right; color: #f1c40f; font-weight: bold;">{m_meta.get('n_train', 0) + m_meta.get('n_test', 0):,} rows</td>
+                            </tr>
+                        </table>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+
+        with c_right:
+            st.markdown("### 🎛️ Orchestration & Storage Stats")
+            dag_run = stats_data.get("last_dag_run")
+            hdfs_stats = stats_data.get("hdfs", {})
+
+            st.markdown(
+                f"""
+                <div style="background-color: #1e1e2e; padding: 20px; border-radius: 8px; border: 1px solid #44475a;">
+                    <table style="width: 100%; border-collapse: collapse;">
+                        <tr>
+                            <td style="padding: 8px 0; color: #a6adc8; font-weight: bold;">Airflow Pipeline DAG</td>
+                            <td style="padding: 8px 0; text-align: right; color: #8be9fd; font-family: monospace;">ids_network_flow_pipeline</td>
+                        </tr>
+                        <tr>
+                            <td style="padding: 8px 0; color: #a6adc8; font-weight: bold;">Latest DAG Run Status</td>
+                            <td style="padding: 8px 0; text-align: right; color: #ffb86c; font-weight: bold;">{dag_run.get('state', 'NO RUNS FOUND') if dag_run else 'NO RUNS FOUND'}</td>
+                        </tr>
+                        <tr>
+                            <td style="padding: 8px 0; color: #a6adc8; font-weight: bold;">DAG Run Execution Date</td>
+                            <td style="padding: 8px 0; text-align: right; color: #f8f8f2; font-size: 13px;">{dag_run.get('execution_date', 'N/A') if dag_run else 'N/A'}</td>
+                        </tr>
+                        <tr>
+                            <td style="padding: 8px 0; color: #a6adc8; font-weight: bold;">HDFS Raw Size</td>
+                            <td style="padding: 8px 0; text-align: right; color: #f8f8f2;">{hdfs_stats.get('raw_size_mb', 0.0):,} MB</td>
+                        </tr>
+                        <tr>
+                            <td style="padding: 8px 0; color: #a6adc8; font-weight: bold;">HDFS Processed Size</td>
+                            <td style="padding: 8px 0; text-align: right; color: #50fa7b; font-weight: bold;">{hdfs_stats.get('processed_size_mb', 0.0):,} MB</td>
+                        </tr>
+                    </table>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+        # ───────────────────────────────────────────────────────────────────
+        # 3. Accuracy & Data Leakage Panel
+        # ───────────────────────────────────────────────────────────────────
+        st.divider()
+        st.markdown("### 🎯 Model Accuracy & Validation Metrics")
+
+        if m_meta:
+            met = m_meta.get("metrics", {})
+
+            # ⚠ Data Leakage Check Note (High Warning if > 99.5%)
+            if m_meta.get("leakage_warning", False) or met.get("accuracy", 0.0) >= 0.995:
+                st.warning(
+                    "⚠️ **POTENTIAL DATA LEAKAGE DETECTED:** "
+                    f"The trained model achieved an accuracy of **{met.get('accuracy', 0.0)*100:.2f}%**. "
+                    "In the CIC-IDS 2018 dataset, this is highly indicative of destination port (`dst_port`) memorisation. "
+                    "Tree models easily memorise fixed target ports (e.g. DoS targeting port 80). "
+                    "Please verify feature relevance in production."
+                )
+
+            a1, a2, a3, a4, a5 = st.columns(5)
+            a1.metric("Accuracy",  f"{met.get('accuracy',  0.0)*100:.2f}%", help="Correct predictions / total predictions")
+            a2.metric("Precision", f"{met.get('precision', 0.0)*100:.2f}%", help="True positive attacks / total predicted attacks")
+            a3.metric("Recall",    f"{met.get('recall',    0.0)*100:.2f}%", help="True positive attacks / total actual attacks")
+            a4.metric("F1 Score",  f"{met.get('f1',        0.0)*100:.2f}%", help="Harmonic mean of precision and recall")
+            a5.metric("ROC-AUC",   f"{met.get('auc',       0.0)*100:.2f}%", help="Area under the Receiver Operating Characteristic curve")
+
+            st.caption(
+                f"**Evaluation Context:** Stratified 80/20 train/test split. "
+                f"Test set size: **{m_meta.get('n_test', 0):,} rows**."
+            )
+
+            # Model evaluation plot images from FastAPI
+            st.markdown("#### Evaluation Plots")
+            p_col1, p_col2, p_col3 = st.columns(3)
+            p_col1.image(f"{API_URL}/model-plot/confusion_matrix",    caption="Confusion Matrix", use_column_width=True)
+            p_col2.image(f"{API_URL}/model-plot/roc_curve",           caption="ROC Curve", use_column_width=True)
+            p_col3.image(f"{API_URL}/model-plot/feature_importance",  caption="Feature Importance Rankings", use_column_width=True)
+        else:
+            st.info("Evaluation metrics and plots will load once the model is trained.")
+
+        # ───────────────────────────────────────────────────────────────────
+        # 4. Dataset Status Panel (Ingestion & Live Class Balance)
+        # ───────────────────────────────────────────────────────────────────
+        st.divider()
+        st.markdown("### 📊 Live Dataset Ingestion & Class Balance")
+
+        pg_stats = stats_data.get("postgres", {})
+        total_ingested = pg_stats.get("total_flows", 0)
+
+        d_col1, d_col2 = st.columns([1, 2])
+
+        with d_col1:
+            st.subheader("Postgres Live Database")
+            st.markdown(
+                f"""
+                <div style="background-color: #1e1e2e; padding: 25px; border-radius: 8px; text-align: center; border: 1px solid #44475a;">
+                    <span style="color: #a6adc8; font-size: 14px; font-weight: bold;">TOTAL FLOWS INGESTED</span>
+                    <h1 style="color: #8be9fd; margin: 10px 0; font-size: 40px; font-weight: 800;">{total_ingested:,}</h1>
+                    <span style="color: #a6adc8; font-size: 12px;">Active database records in postgresql</span>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+            # Rolling counter last hour
+            benign_hour = pg_stats.get("benign_last_hour", 0)
+            attack_hour = pg_stats.get("attack_last_hour", 0)
+            st.markdown(
+                f"""
+                <div style="background-color: #1e1e2e; padding: 15px; border-radius: 8px; margin-top: 15px; border: 1px solid #44475a;">
+                    <span style="color: #a6adc8; font-size: 12px; font-weight: bold; display: block; margin-bottom: 8px;">ROLLING LAST HOUR DETECTION</span>
+                    <div style="display: flex; justify-content: space-between;">
+                        <span style="color: #2ecc71; font-weight: bold;">✅ Benign: {benign_hour:,}</span>
+                        <span style="color: #e74c3c; font-weight: bold;">⚠️ Attack: {attack_hour:,}</span>
+                    </div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+        with d_col2:
+            st.subheader("Database Class Distribution")
+            b_cnt = pg_stats.get("benign_count", 0)
+            a_cnt = pg_stats.get("attack_count", 0)
+
+            if b_cnt == 0 and a_cnt == 0:
+                st.info("No ingested prediction records found in the database yet.")
+            else:
+                pie_df = pd.DataFrame({
+                    "Traffic Class": ["Benign", "Attack"],
+                    "Flow Count":    [b_cnt, a_cnt],
+                })
+                fig = px.pie(
+                    pie_df, names="Traffic Class", values="Flow Count",
+                    color="Traffic Class",
+                    color_discrete_map={"Benign": "#2ecc71", "Attack": "#e74c3c"},
+                    hole=0.45,
+                )
+                fig.update_layout(
+                    margin=dict(t=10, b=10, l=10, r=10),
+                    paper_bgcolor="rgba(0,0,0,0)",
+                    plot_bgcolor="rgba(0,0,0,0)",
+                    legend=dict(font=dict(color=_TEXT)),
+                )
+                st.plotly_chart(fig, use_container_width=True)
+
+        # ───────────────────────────────────────────────────────────────────
+        # 5. Live Activity Feed (Highlighting Attacks in Red)
+        # ───────────────────────────────────────────────────────────────────
+        st.divider()
+        st.markdown("### 📡 Live Network Flow Activity Feed")
+
+        flows_data = api_get("/flows", params={"limit": 50})
+
+        if flows_data:
+            df_live = pd.DataFrame(flows_data)
+
+            # Styling function to highlight attacks in soft red
+            def highlight_attack(row):
+                is_att = row["is_attack"]
+                if is_att == 1 or is_att is True or str(is_att).lower() == "true":
+                    return ["background-color: rgba(231, 76, 60, 0.25); color: #ff5555; font-weight: bold;"] * len(row)
+                return [""] * len(row)
+
+            # Standardise verdict display
+            if "is_attack" in df_live.columns:
+                df_live["verdict"] = df_live["is_attack"].map(
+                    {True: "⚠️ ATTACK", False: "Benign", 1: "⚠️ ATTACK", 0: "Benign"}
+                )
+
+            cols_order = [
+                "flow_id", "created_at", "dst_port", "protocol", "flow_duration",
+                "tot_fwd_pkts", "tot_bwd_pkts", "flow_byts_per_s", "flow_pkts_per_s",
+                "attack_confidence", "verdict",
+            ]
+            available = [c for c in cols_order if c in df_live.columns]
+
+            # Style and display DataFrame
+            styled_df = df_live[available].style.apply(highlight_attack, axis=1)
+            st.dataframe(styled_df, use_container_width=True, height=400)
+        else:
+            st.info("Waiting for live network flows to be ingested...")

@@ -7,6 +7,9 @@ Endpoints:
 """
 
 import os
+import json
+import time
+import requests
 from contextlib import contextmanager
 from typing import Optional
 
@@ -14,6 +17,7 @@ import joblib
 import pandas as pd
 import psycopg2
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 # ---------------------------------------------------------------------------
@@ -262,3 +266,212 @@ def update_flow(flow_id: int, flow: NetworkFlow):
         "confidence": confidence,
         "verdict":    "⚠️ ATTACK DETECTED" if is_attack else "✅ Benign Traffic",
     }
+
+
+# ---------------------------------------------------------------------------
+# Component Health & Caching Logic
+# ---------------------------------------------------------------------------
+_cache = {}
+
+
+def get_cached_status(key: str, check_fn, ttl: int = 30) -> str:
+    now = time.time()
+    if key in _cache:
+        val, expiry = _cache[key]
+        if now < expiry:
+            return val
+    val = check_fn()
+    _cache[key] = (val, now + ttl)
+    return val
+
+
+def check_kafka() -> str:
+    try:
+        from kafka import KafkaAdminClient
+        # Attempt connection check
+        admin = KafkaAdminClient(bootstrap_servers="kafka:29092", request_timeout_ms=1000)
+        admin.list_topics()
+        admin.close()
+        return "healthy"
+    except Exception as e:
+        print(f"[health] Kafka check failed: {e}")
+        return "unhealthy"
+
+
+def check_spark() -> str:
+    try:
+        # Check Spark Master REST API
+        r = requests.get("http://spark-master:8080/json/", timeout=1.0)
+        if r.status_code == 200:
+            return "healthy"
+        return "degraded"
+    except Exception as e:
+        print(f"[health] Spark check failed: {e}")
+        return "unhealthy"
+
+
+def check_hdfs() -> str:
+    try:
+        # Query WebHDFS status
+        r = requests.get("http://namenode:9870/webhdfs/v1/?op=GETHOMEDIRECTORY", timeout=1.5)
+        if r.status_code in [200, 401, 403, 404]:
+            return "healthy"
+        return "degraded"
+    except Exception as e:
+        print(f"[health] HDFS check failed: {e}")
+        return "unhealthy"
+
+
+def check_airflow() -> str:
+    try:
+        with psycopg2.connect(DB_URL) as conn:
+            with conn.cursor() as cur:
+                # Check dag_run table to see if Airflow metadata exists and is accessible
+                cur.execute(
+                    "SELECT state FROM dag_run WHERE dag_id='ids_network_flow_pipeline' ORDER BY execution_date DESC LIMIT 1"
+                )
+                row = cur.fetchone()
+                if row:
+                    return "healthy" if row[0] in ["success", "running"] else "degraded"
+                return "healthy"  # Table exists, but no runs yet
+    except Exception as e:
+        print(f"[health] Airflow check failed: {e}")
+        return "unhealthy"
+
+
+def check_model() -> str:
+    if os.path.exists(f"{MODELS_DIR}/ids_classifier.joblib"):
+        return "healthy"
+    return "unhealthy"
+
+
+# ---------------------------------------------------------------------------
+# Health & Metrics Endpoints
+# ---------------------------------------------------------------------------
+@app.get("/status")
+def get_system_status():
+    """Retrieve system components health status."""
+    return {
+        "kafka":   get_cached_status("kafka", check_kafka, ttl=10),
+        "spark":   get_cached_status("spark", check_spark, ttl=10),
+        "hdfs":    get_cached_status("hdfs", check_hdfs, ttl=30),
+        "airflow": get_cached_status("airflow", check_airflow, ttl=30),
+        "model":   check_model(),
+    }
+
+
+@app.get("/stats")
+def get_system_stats():
+    """Aggregate real dataset, Postgres, and ML metadata stats."""
+    # ── 1. HDFS Folder Sizes ──
+    raw_size_mb  = 0.0
+    proc_size_mb = 0.0
+    try:
+        raw_r = requests.get("http://namenode:9870/webhdfs/v1/ids/raw?op=GETCONTENTSUMMARY", timeout=1.0)
+        if raw_r.status_code == 200:
+            raw_size_mb = round(raw_r.json()["ContentSummary"]["spaceConsumed"] / (1024 * 1024), 2)
+    except Exception:
+        pass
+
+    try:
+        proc_r = requests.get("http://namenode:9870/webhdfs/v1/ids/processed?op=GETCONTENTSUMMARY", timeout=1.0)
+        if proc_r.status_code == 200:
+            proc_size_mb = round(proc_r.json()["ContentSummary"]["spaceConsumed"] / (1024 * 1024), 2)
+    except Exception:
+        pass
+
+    # ── 2. Postgres counts ──
+    total_flows      = 0
+    benign_count     = 0
+    attack_count     = 0
+    benign_last_hour = 0
+    attack_last_hour = 0
+
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) FROM network_flows")
+                total_flows = cur.fetchone()[0]
+
+                cur.execute("SELECT is_attack, COUNT(*) FROM predictions GROUP BY is_attack")
+                for row in cur.fetchall():
+                    if row[0]:
+                        attack_count = row[1]
+                    else:
+                        benign_count = row[1]
+
+                cur.execute(
+                    """
+                    SELECT is_attack, COUNT(*)
+                    FROM predictions
+                    WHERE predicted_at >= NOW() - INTERVAL '1 hour'
+                    GROUP BY is_attack
+                    """
+                )
+                for row in cur.fetchall():
+                    if row[0]:
+                        attack_last_hour = row[1]
+                    else:
+                        benign_last_hour = row[1]
+    except Exception as e:
+        print(f"[api] Error reading Postgres stats: {e}")
+
+    # ── 3. Model training metadata ──
+    model_meta = None
+    meta_path = f"{MODELS_DIR}/model_metadata.json"
+    if os.path.exists(meta_path):
+        try:
+            with open(meta_path, "r") as fh:
+                model_meta = json.load(fh)
+        except Exception:
+            pass
+
+    # ── 4. Latest DAG runs ──
+    last_dag_run = None
+    try:
+        with psycopg2.connect(DB_URL) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT state, execution_date, end_date
+                    FROM dag_run
+                    WHERE dag_id='ids_network_flow_pipeline'
+                    ORDER BY execution_date DESC
+                    LIMIT 1
+                    """
+                )
+                row = cur.fetchone()
+                if row:
+                    last_dag_run = {
+                        "state":          row[0],
+                        "execution_date": str(row[1]),
+                        "end_date":       str(row[2]) if row[2] else None,
+                    }
+    except Exception:
+        pass
+
+    return {
+        "hdfs": {
+            "raw_size_mb":       raw_size_mb,
+            "processed_size_mb": proc_size_mb,
+        },
+        "postgres": {
+            "total_flows":       total_flows,
+            "benign_count":      benign_count,
+            "attack_count":      attack_count,
+            "benign_last_hour":  benign_last_hour,
+            "attack_last_hour":  attack_last_hour,
+        },
+        "model_metadata": model_meta,
+        "last_dag_run":   last_dag_run,
+    }
+
+
+@app.get("/model-plot/{plot_name}")
+def get_model_plot(plot_name: str):
+    """Retrieve confusion_matrix.png, roc_curve.png, or feature_importance.png."""
+    filename = f"{plot_name}.png"
+    filepath = os.path.join(MODELS_DIR, filename)
+    if not os.path.exists(filepath):
+        raise HTTPException(status_code=404, detail=f"Plot {plot_name} not found.")
+    return FileResponse(filepath, media_type="image/png")

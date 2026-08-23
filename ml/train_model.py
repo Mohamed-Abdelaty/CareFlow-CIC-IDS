@@ -18,20 +18,29 @@ Design notes:
 """
 
 import io
+import json
 import os
+import time
 import warnings
+from datetime import datetime, timezone
 
 import joblib
+import matplotlib
+matplotlib.use("Agg")   # non-interactive backend — must be set before pyplot import
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import requests
+import seaborn as sns
 from sklearn.metrics import (
     accuracy_score,
     classification_report,
+    confusion_matrix,
     f1_score,
     precision_score,
     recall_score,
     roc_auc_score,
+    roc_curve,
 )
 from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
@@ -46,7 +55,8 @@ warnings.filterwarnings("ignore")
 HDFS_NAMENODE   = os.getenv("HDFS_NAMENODE",  "http://namenode:9870")
 PROCESSED_PATH  = "/ids/processed"
 MODELS_DIR      = os.getenv("MODELS_DIR",     "/models")
-CSV_FALLBACK    = os.getenv("CSV_FALLBACK",   "/data/raw")   # first CSV found
+# Training only reads from HDFS — no CSV fallback.
+# Run Spark streaming first to populate HDFS before training.
 
 # Features selected for training:
 #   - All numeric, directly measured from the network flow
@@ -120,40 +130,99 @@ def load_from_hdfs() -> pd.DataFrame | None:
     return df
 
 
-def load_from_csv_fallback() -> pd.DataFrame | None:
-    """Read the first CSV in /data/raw as a fallback when HDFS has no data yet."""
-    import glob
-    files = sorted(glob.glob(os.path.join(CSV_FALLBACK, "*.csv")))
-    if not files:
-        print(f"[trainer] No CSV fallback found in {CSV_FALLBACK}.")
-        return None
+# ---------------------------------------------------------------------------
+# Plot generation & metadata
+# ---------------------------------------------------------------------------
+_DARK_BG = "#1e1e2e"
+_AXES_BG = "#282a36"
+_GREEN   = "#50fa7b"
+_RED     = "#ff5555"
+_CYAN    = "#8be9fd"
+_TEXT    = "#f8f8f2"
 
-    filepath = files[0]
-    print(f"[trainer] CSV fallback: {filepath}")
-    chunks = []
-    for chunk in pd.read_csv(filepath, chunksize=100_000, low_memory=False,
-                              encoding="utf-8", on_bad_lines="skip"):
-        # Normalise column names (same logic as producer)
-        chunk.columns = (
-            chunk.columns
-            .str.strip()
-            .str.lower()
-            .str.replace(r"/s$", "_per_s", regex=True)
-            .str.replace("/", "_per_", regex=False)
-            .str.replace(" ", "_", regex=False)
-            .str.replace(".", "", regex=False)
-        )
-        # Remove repeated-header rows
-        if "label" in chunk.columns:
-            chunk = chunk[chunk["label"].str.lower() != "label"]
-        chunks.append(chunk)
 
-    df = pd.concat(chunks, ignore_index=True)
-    # Binarise label in fallback
-    if "label" in df.columns:
-        df[TARGET] = (df["label"].str.strip().str.lower() != "benign").astype(int)
-    print(f"[trainer] CSV fallback loaded {len(df):,} rows.")
-    return df
+def _apply_dark(fig, ax):
+    """Apply a consistent dark theme to a matplotlib figure."""
+    fig.patch.set_facecolor(_DARK_BG)
+    ax.set_facecolor(_AXES_BG)
+    ax.tick_params(colors=_TEXT)
+    ax.xaxis.label.set_color(_TEXT)
+    ax.yaxis.label.set_color(_TEXT)
+    ax.title.set_color(_TEXT)
+    for spine in ax.spines.values():
+        spine.set_edgecolor("#44475a")
+
+
+def save_plots(y_test, y_pred, y_prob, pipeline) -> None:
+    """Generate and save confusion matrix, ROC curve, and feature importance PNGs."""
+    os.makedirs(MODELS_DIR, exist_ok=True)
+    plt.rcParams.update({"text.color": _TEXT, "axes.labelcolor": _TEXT})
+
+    # 1. Confusion Matrix
+    cm = confusion_matrix(y_test, y_pred)
+    fig, ax = plt.subplots(figsize=(5, 4))
+    sns.heatmap(
+        cm, annot=True, fmt="d", cmap="Blues",
+        xticklabels=["Benign", "Attack"],
+        yticklabels=["Benign", "Attack"],
+        linewidths=0.5, ax=ax,
+        annot_kws={"color": _TEXT},
+    )
+    ax.set_xlabel("Predicted Label")
+    ax.set_ylabel("True Label")
+    ax.set_title("Confusion Matrix (Test Set)")
+    _apply_dark(fig, ax)
+    fig.tight_layout()
+    fig.savefig(f"{MODELS_DIR}/confusion_matrix.png", dpi=150,
+                bbox_inches="tight", facecolor=_DARK_BG)
+    plt.close(fig)
+    print("[trainer] Saved confusion_matrix.png")
+
+    # 2. ROC Curve
+    fpr, tpr, _ = roc_curve(y_test, y_prob)
+    auc_val = roc_auc_score(y_test, y_prob)
+    fig, ax = plt.subplots(figsize=(5, 4))
+    ax.plot(fpr, tpr, color=_GREEN, lw=2, label=f"AUC = {auc_val:.4f}")
+    ax.plot([0, 1], [0, 1], color=_RED, lw=1, linestyle="--", label="Random")
+    ax.set_xlim([0.0, 1.0])
+    ax.set_ylim([0.0, 1.05])
+    ax.set_xlabel("False Positive Rate")
+    ax.set_ylabel("True Positive Rate")
+    ax.set_title("ROC Curve (Test Set)")
+    ax.legend(facecolor=_AXES_BG, labelcolor=_TEXT, framealpha=0.8)
+    _apply_dark(fig, ax)
+    fig.tight_layout()
+    fig.savefig(f"{MODELS_DIR}/roc_curve.png", dpi=150,
+                bbox_inches="tight", facecolor=_DARK_BG)
+    plt.close(fig)
+    print("[trainer] Saved roc_curve.png")
+
+    # 3. Feature Importance
+    clf         = pipeline.named_steps["clf"]
+    importances = clf.feature_importances_
+    sorted_idx  = np.argsort(importances)
+    feat_names  = [FEATURES[i] for i in sorted_idx]
+    feat_vals   = importances[sorted_idx]
+    colors      = [_GREEN if v == feat_vals.max() else _CYAN for v in feat_vals]
+
+    fig, ax = plt.subplots(figsize=(7, 5))
+    ax.barh(feat_names, feat_vals, color=colors)
+    ax.set_xlabel("Feature Importance (gain)")
+    ax.set_title("Feature Importance — XGBoost")
+    _apply_dark(fig, ax)
+    fig.tight_layout()
+    fig.savefig(f"{MODELS_DIR}/feature_importance.png", dpi=150,
+                bbox_inches="tight", facecolor=_DARK_BG)
+    plt.close(fig)
+    print("[trainer] Saved feature_importance.png")
+
+
+def save_metadata(meta: dict) -> None:
+    """Write training metadata to model_metadata.json for the API to read."""
+    path = f"{MODELS_DIR}/model_metadata.json"
+    with open(path, "w") as fh:
+        json.dump(meta, fh, indent=2)
+    print(f"[trainer] Metadata written to {path}")
 
 
 # ---------------------------------------------------------------------------
@@ -210,7 +279,9 @@ def train(df: pd.DataFrame) -> None:
     ])
 
     print("[trainer] Training XGBClassifier ...")
+    train_start = time.time()
     pipeline.fit(X_train, y_train)
+    train_duration = round(time.time() - train_start, 1)
 
     # Evaluate on the held-out test set
     y_pred      = pipeline.predict(X_test)
@@ -232,17 +303,48 @@ def train(df: pd.DataFrame) -> None:
     print(classification_report(y_test, y_pred,
                                 target_names=["Benign", "Attack"]))
 
-    # Persist model and metadata
-    joblib.dump(pipeline,                            f"{MODELS_DIR}/ids_classifier.joblib")
+    if accuracy >= 0.995:
+        print(
+            "[trainer] ⚠  Accuracy >= 99.5% — consider checking for data leakage "
+            "(e.g. dst_port memorisation). This warning is recorded in metadata.",
+            flush=True,
+        )
+
+    # Persist model files
+    joblib.dump(pipeline, f"{MODELS_DIR}/ids_classifier.joblib")
     joblib.dump({"features": FEATURES, "target": TARGET},
-                                                     f"{MODELS_DIR}/model_meta.joblib")
+                f"{MODELS_DIR}/model_meta.joblib")
     joblib.dump({"accuracy": accuracy, "precision": precision,
                  "recall": recall, "f1": f1, "auc": auc,
                  "n_train": len(X_train), "n_test": len(X_test),
                  "n_benign": n_benign, "n_attack": n_attack},
-                                                     f"{MODELS_DIR}/metrics.joblib")
+                f"{MODELS_DIR}/metrics.joblib")
 
-    print(f"[trainer] Models saved to {MODELS_DIR}", flush=True)
+    # Generate evaluation plots (PNG files read by the API /model-plot endpoint)
+    save_plots(y_test, y_pred, y_prob, pipeline)
+
+    # Write JSON metadata (read by the API /stats and /status endpoints)
+    save_metadata({
+        "model_version":          "ids_classifier_v2",
+        "trained_at":             datetime.now(timezone.utc).isoformat(),
+        "training_duration_sec":  train_duration,
+        "n_train":                len(X_train),
+        "n_test":                 len(X_test),
+        "n_benign":               n_benign,
+        "n_attack":               n_attack,
+        "hdfs_path":              PROCESSED_PATH,
+        "features":               FEATURES,
+        "leakage_warning":        accuracy >= 0.995,
+        "metrics": {
+            "accuracy":  round(accuracy,  6),
+            "precision": round(precision, 6),
+            "recall":    round(recall,    6),
+            "f1":        round(f1,        6),
+            "auc":       round(auc,       6),
+        },
+    })
+
+    print(f"[trainer] All artifacts saved to {MODELS_DIR}", flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -250,12 +352,16 @@ def train(df: pd.DataFrame) -> None:
 # ---------------------------------------------------------------------------
 def main():
     df = load_from_hdfs()
-    if df is None or len(df) < 100:
-        print("[trainer] HDFS data insufficient — using CSV fallback.")
-        df = load_from_csv_fallback()
 
     if df is None or len(df) < 100:
-        print("[trainer] No usable data found. Exiting.")
+        print(
+            "[trainer] No data found in HDFS at path: "
+            f"{PROCESSED_PATH}\n"
+            "[trainer] The model will NOT train on raw CSV files.\n"
+            "[trainer] Please wait for Spark to process and write "
+            "data to HDFS first, then re-run the trainer.",
+            flush=True,
+        )
         return
 
     train(df)
