@@ -1,55 +1,80 @@
 """
-Spark Structured Streaming job — CIC-IDS 2018 Network Intrusion Detection
-Reads network-flow JSON messages from Kafka, applies a multi-step cleaning
-pipeline, writes raw and processed Parquet datasets to HDFS.
+Spark Structured Streaming — CareFlow IDS Unified Inference Pipeline
+=====================================================================
+Reads network-flow JSON messages from Kafka, applies cleaning, runs
+GBTClassifier inference from a pre-trained Spark PipelineModel, and
+writes all outputs inside a SINGLE foreachBatch call:
 
-Cleaning pipeline:
-  1. Parse JSON payload into typed columns
-  2. Drop rows missing any critical numeric field
-  3. Cast all feature columns to DoubleType
-  4. Filter physically impossible values (negative durations, bytes, etc.)
-  5. Drop rows where flow_byts_per_s or flow_pkts_per_s is null
-     (result of Infinity in source CSV — division-by-zero in CICFlowMeter)
-  6. Binarise the label: 'Benign' -> 0, any attack -> 1
+    ┌─ HDFS /ids/raw                   — raw Parquet  (SparkSQL source)
+    ├─ HDFS /ids/processed             — cleaned + is_attack label (SparkSQL training input)
+    ├─ PostgreSQL: network_flows       — inference results (API read source)
+    └─ PostgreSQL: flow_submissions    — submission status update
 
-NOTE on Dst Port (dst_port):
-  Kept as a feature, but it is a known partial-leakage risk in IDS-2018 —
-  certain attack types (e.g. DoS GoldenEye) consistently target specific
-  ports, so the model may memorise port numbers rather than learning
-  true traffic patterns.  This limitation is documented here for awareness.
+Architecture:
+    POST /flows (FastAPI)
+      │  generates UUID flow_id, registers 'pending' in PostgreSQL
+      ▼
+    Kafka topic: network_flows_stream
+      │
+      ▼
+    THIS JOB (Structured Streaming — foreachBatch)
+      ├─ parse → clean → watermark → deduplicate
+      ├─ write HDFS /ids/raw          (SparkSQL Big Data storage)
+      ├─ write HDFS /ids/processed    (SparkSQL Big Data storage — partitioned by ingest_date)
+      ├─ GBT inference → write PostgreSQL network_flows  (API serving layer)
+      └─ update PostgreSQL flow_submissions → 'done'
 """
 
 import os
+from datetime import datetime, timezone
 
+import psycopg2
+import psycopg2.extras
+from pyspark.ml import PipelineModel
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import (
-    col,
-    from_json,
-    lower,
-    trim,
-    when,
-)
+from pyspark.sql import functions as F
 from pyspark.sql.types import (
     DoubleType,
     LongType,
     StringType,
     StructField,
     StructType,
+    TimestampType,
 )
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP", "kafka:29092")
-TOPIC           = os.getenv("KAFKA_TOPIC",     "network_flows_stream")
-HDFS_URI        = os.getenv("HDFS_URI",        "hdfs://namenode:8020")
-RAW_PATH        = f"{HDFS_URI}/ids/raw"
-PROCESSED_PATH  = f"{HDFS_URI}/ids/processed"
-CHECKPOINT_PATH = f"{HDFS_URI}/ids/checkpoints"
+KAFKA_BOOTSTRAP  = os.getenv("KAFKA_BOOTSTRAP",  "kafka:29092")
+TOPIC            = os.getenv("KAFKA_TOPIC",       "network_flows_stream")
+HDFS_URI         = os.getenv("HDFS_URI",          "hdfs://namenode:8020")
+RAW_PATH         = f"{HDFS_URI}/ids/raw"
+PROCESSED_PATH   = f"{HDFS_URI}/ids/processed"
+CHECKPOINT_PATH  = f"{HDFS_URI}/ids/checkpoints"
+MODEL_PATH       = f"{HDFS_URI}/ids/models/gbt_pipeline"
 
-# All columns sent by the producer (string-typed from CSV origin).
-# We declare them all as StringType first, then cast the numeric ones.
+# PostgreSQL connection (replaces SQLite + DuckDB)
+DB_HOST = os.getenv("DB_HOST", "careflow-postgres")
+DB_PORT = os.getenv("DB_PORT", "5432")
+DB_NAME = os.getenv("DB_NAME", "careflow_ids")
+DB_USER = os.getenv("DB_USER", "careflow")
+DB_PASS = os.getenv("DB_PASS", "careflow_pass")
+
+JDBC_URL = f"jdbc:postgresql://{DB_HOST}:{DB_PORT}/{DB_NAME}"
+JDBC_PROPS = {
+    "user":     DB_USER,
+    "password": DB_PASS,
+    "driver":   "org.postgresql.Driver",
+}
+
+MODEL_VERSION = "gbt_v1"
+
+# ---------------------------------------------------------------------------
+# Kafka message schema
+# ---------------------------------------------------------------------------
 SCHEMA = StructType([
+    StructField("flow_id",            StringType(), True),
+    StructField("kafka_ingest_ts",    StringType(), True),
     StructField("dst_port",           StringType(), True),
     StructField("protocol",           StringType(), True),
     StructField("flow_duration",      StringType(), True),
@@ -74,7 +99,6 @@ SCHEMA = StructType([
     StructField("label",              StringType(), True),
 ])
 
-# Columns to cast to Double (all numeric features + target before binarisation)
 NUMERIC_COLS = [
     "dst_port", "protocol", "flow_duration", "tot_fwd_pkts", "tot_bwd_pkts",
     "totlen_fwd_pkts", "totlen_bwd_pkts", "flow_byts_per_s", "flow_pkts_per_s",
@@ -83,7 +107,6 @@ NUMERIC_COLS = [
     "init_fwd_win_byts", "init_bwd_win_byts", "active_mean", "idle_mean",
 ]
 
-# Critical fields — rows missing any of these are dropped
 CRITICAL_COLS = [
     "flow_duration", "tot_fwd_pkts", "tot_bwd_pkts",
     "flow_byts_per_s", "flow_pkts_per_s", "label",
@@ -91,85 +114,186 @@ CRITICAL_COLS = [
 
 
 # ---------------------------------------------------------------------------
-# Streaming processing function
+# PostgreSQL helper — psycopg2 connection
+# ---------------------------------------------------------------------------
+def _pg_conn():
+    return psycopg2.connect(
+        host=DB_HOST, port=DB_PORT, dbname=DB_NAME,
+        user=DB_USER, password=DB_PASS,
+    )
+
+
+def _update_submission_status(flow_ids: list, status: str):
+    """Bulk-update flow_submissions rows to given status in PostgreSQL."""
+    if not flow_ids:
+        return
+    try:
+        completed_at = datetime.now(timezone.utc).isoformat()
+        conn = _pg_conn()
+        with conn.cursor() as cur:
+            psycopg2.extras.execute_batch(
+                cur,
+                "UPDATE flow_submissions SET status=%s, completed_at=%s WHERE flow_id=%s",
+                [(status, completed_at, fid) for fid in flow_ids],
+            )
+        conn.commit()
+        conn.close()
+        print(f"[stream] Updated {len(flow_ids)} flow_submissions → '{status}'.", flush=True)
+    except Exception as exc:
+        print(f"[stream] WARNING: Could not update flow_submissions in PostgreSQL: {exc}", flush=True)
+
+
+# ---------------------------------------------------------------------------
+# Lazy model loader
+# ---------------------------------------------------------------------------
+_gbt_model = None
+
+
+def get_gbt_model():
+    global _gbt_model
+    if _gbt_model is None:
+        try:
+            _gbt_model = PipelineModel.load(MODEL_PATH)
+            print(f"[stream] GBT PipelineModel loaded from {MODEL_PATH}", flush=True)
+        except Exception as exc:
+            print(f"[stream] WARNING: Could not load GBT model: {exc}. Inference skipped.", flush=True)
+    return _gbt_model
+
+
+# ---------------------------------------------------------------------------
+# foreachBatch handler
 # ---------------------------------------------------------------------------
 def process_batch(batch_df, batch_id):
     if batch_df.isEmpty():
         return
 
-    # ── Step 1: Parse JSON ──────────────────────────────────────────────────
+    # ── 1. Parse JSON ─────────────────────────────────────────────────────────
     parsed = (
         batch_df
-        .select(from_json(col("value").cast("string"), SCHEMA).alias("d"))
+        .select(F.from_json(F.col("value").cast("string"), SCHEMA).alias("d"))
         .select("d.*")
     )
 
-    # ── Step 2: Write raw records to HDFS ───────────────────────────────────
-    (
-        parsed.write
-        .mode("append")
-        .parquet(RAW_PATH)
+    # ── 2. Write raw snapshot to HDFS (SparkSQL Big Data storage) ─────────────
+    parsed.write.mode("append").parquet(RAW_PATH)
+
+    # ── 3. Parse kafka_ingest_ts string → TimestampType ───────────────────────
+    parsed = parsed.withColumn(
+        "kafka_ingest_ts",
+        F.to_timestamp(F.col("kafka_ingest_ts")),
     )
 
-    # ── Step 3: Normalise label text ────────────────────────────────────────
-    cleaned = parsed.withColumn("label", trim(lower(col("label"))))
-
-    # ── Step 4: Drop rows missing critical fields ────────────────────────────
+    # ── 4. Normalise label + drop missing critical fields ─────────────────────
+    cleaned = parsed.withColumn("label", F.trim(F.lower(F.col("label"))))
     cleaned = cleaned.dropna(subset=CRITICAL_COLS)
 
-    # ── Step 5: Cast all numeric columns to Double ──────────────────────────
+    # ── 5. Cast numerics to Double ────────────────────────────────────────────
     for c in NUMERIC_COLS:
-        cleaned = cleaned.withColumn(c, col(c).cast(DoubleType()))
+        cleaned = cleaned.withColumn(c, F.col(c).cast(DoubleType()))
 
-    # ── Step 6: Filter physically impossible / Infinity-derived values ───────
-    # Infinity in flow_byts_per_s / flow_pkts_per_s comes from
-    # CICFlowMeter dividing by zero when flow_duration == 0.
-    # Negative duration or packet counts are also impossible.
+    # ── 6. Filter impossible / Infinity values ────────────────────────────────
     cleaned = cleaned.filter(
-        (col("flow_duration")   >= 0) &
-        (col("tot_fwd_pkts")    >= 0) &
-        (col("tot_bwd_pkts")    >= 0) &
-        (col("flow_byts_per_s").isNotNull()) &
-        (col("flow_pkts_per_s").isNotNull()) &
-        (col("flow_byts_per_s") >= 0) &
-        (col("flow_pkts_per_s") >= 0)
+        (F.col("flow_duration")   >= 0) &
+        (F.col("tot_fwd_pkts")    >= 0) &
+        (F.col("tot_bwd_pkts")    >= 0) &
+        (F.col("flow_byts_per_s").isNotNull()) &
+        (F.col("flow_pkts_per_s").isNotNull()) &
+        (F.col("flow_byts_per_s") >= 0) &
+        (F.col("flow_pkts_per_s") >= 0)
     )
 
-    # ── Step 7: Binarise label → 0 = Benign, 1 = Attack ────────────────────
+    # ── 7. Binarise label → is_attack ─────────────────────────────────────────
     cleaned = cleaned.withColumn(
         "is_attack",
-        when(col("label") == "benign", 0).otherwise(1).cast(LongType()),
+        F.when(F.col("label") == "benign", 0).otherwise(1).cast(LongType()),
     )
 
-    # ── Step 8: Drop the raw label string — it must NOT appear in the
-    #   processed output. Keeping it would be a direct target-leakage
-    #   column (the string "benign" / attack-type name is perfectly
-    #   correlated with is_attack and would trivially give 100% accuracy
-    #   if it ever slipped into a feature set).
-    # ── Step 9: Deduplicate within the batch before writing.
-    #   Spark micro-batch streaming uses mode("append"), so the same
-    #   Kafka offsets can be re-processed across trigger intervals
-    #   (e.g. on restart or backfill). Without deduplication, identical
-    #   rows accumulate in HDFS and can appear in BOTH train and test
-    #   splits, letting the model memorise exact rows and report 100%.
+    # ── 8. Watermark-bounded deduplication ────────────────────────────────────
     processed = (
         cleaned
+        .withWatermark("kafka_ingest_ts", "10 minutes")
+        .dropDuplicates(["flow_id"])
+        .withColumn(
+            "ingest_date",
+            F.date_format(F.col("kafka_ingest_ts"), "yyyy-MM-dd"),
+        )
         .drop("label")
-        .dropDuplicates()
     )
 
-    # ── Step 10: Write cleaned, deduplicated records to HDFS ────────────────
+    # ── 9. Write cleaned records to HDFS /ids/processed (SparkSQL source) ─────
     (
         processed.write
         .mode("append")
+        .partitionBy("ingest_date")
         .parquet(PROCESSED_PATH)
     )
 
-    print(
-        f"[spark] Batch {batch_id}: "
-        f"{processed.count()} processed rows written to HDFS.",
-        flush=True,
-    )
+    n_proc = processed.count()
+    print(f"[stream] Batch {batch_id}: {n_proc} processed rows → HDFS.", flush=True)
+
+    # ── 10. GBT inference → write results to PostgreSQL ───────────────────────
+    model = get_gbt_model()
+    if model is not None:
+        try:
+            predictions = model.transform(processed)
+
+            extract_prob = F.udf(
+                lambda v: float(v[1]) if v is not None else None, DoubleType()
+            )
+
+            infer_df = predictions.withColumn(
+                "attack_probability", extract_prob(F.col("probability"))
+            ).withColumn(
+                "is_attack_bool", F.col("prediction").cast("boolean")
+            )
+
+            result_df = infer_df.select(
+                F.col("flow_id").cast("string"),
+                F.col("dst_port").cast("integer"),
+                F.col("protocol").cast("integer"),
+                F.col("flow_duration"),
+                F.col("tot_fwd_pkts"),
+                F.col("tot_bwd_pkts"),
+                F.col("totlen_fwd_pkts"),
+                F.col("totlen_bwd_pkts"),
+                F.col("flow_byts_per_s"),
+                F.col("flow_pkts_per_s"),
+                F.col("flow_iat_mean"),
+                F.col("flow_iat_std"),
+                F.col("fwd_psh_flags"),
+                F.col("fin_flag_cnt"),
+                F.col("syn_flag_cnt"),
+                F.col("rst_flag_cnt"),
+                F.col("psh_flag_cnt"),
+                F.col("ack_flag_cnt"),
+                F.col("init_fwd_win_byts"),
+                F.col("init_bwd_win_byts"),
+                F.col("active_mean"),
+                F.col("idle_mean"),
+                F.col("is_attack_bool").alias("is_attack"),
+                F.col("attack_probability"),
+                F.lit(MODEL_VERSION).alias("model_version"),
+                F.col("kafka_ingest_ts"),
+            )
+
+            # Write inference results to PostgreSQL via JDBC
+            (
+                result_df.write
+                .mode("append")
+                .jdbc(JDBC_URL, "network_flows", properties=JDBC_PROPS)
+            )
+
+            n_written = result_df.count()
+            print(f"[stream] Batch {batch_id}: {n_written} rows → PostgreSQL network_flows.", flush=True)
+
+            # Update flow_submissions → 'done' in PostgreSQL
+            flow_ids = [r["flow_id"] for r in result_df.select("flow_id").collect()]
+            _update_submission_status(flow_ids, "done")
+
+        except Exception as exc:
+            print(f"[stream] Batch {batch_id}: inference/write ERROR: {exc}", flush=True)
+    else:
+        print(f"[stream] Batch {batch_id}: GBT model not available — HDFS write only.", flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -179,6 +303,9 @@ def main():
     spark = (
         SparkSession.builder
         .appName("IDS-NetworkFlow-StreamProcessor")
+        .config("spark.executor.memory",        "2g")
+        .config("spark.driver.memory",          "2g")
+        .config("spark.memory.fraction",        "0.8")
         .config("spark.sql.shuffle.partitions", "4")
         .getOrCreate()
     )
@@ -190,6 +317,7 @@ def main():
         .option("kafka.bootstrap.servers", KAFKA_BOOTSTRAP)
         .option("subscribe", TOPIC)
         .option("startingOffsets", "earliest")
+        .option("maxOffsetsPerTrigger", "500000")
         .option("failOnDataLoss", "false")
         .load()
     )
@@ -197,8 +325,8 @@ def main():
     (
         raw_stream.writeStream
         .foreachBatch(process_batch)
-        .option("checkpointLocation", f"{CHECKPOINT_PATH}/processed")
-        .trigger(processingTime="15 seconds")
+        .option("checkpointLocation", f"{CHECKPOINT_PATH}/unified")
+        .trigger(processingTime="30 seconds")
         .start()
         .awaitTermination()
     )

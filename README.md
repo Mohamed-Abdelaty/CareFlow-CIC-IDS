@@ -9,20 +9,39 @@ Network Flow CSVs
       |
     Kafka  (streaming ingestion)
       |
-    Spark  (structured stream cleaning + labeling)
+    Spark  (structured stream cleaning + dedup + GBT inference)
       |
-    HDFS   (raw + processed storage)
+    HDFS   (raw + processed Parquet, partitioned by ingest_date)
       |
-  Airflow  (orchestrates pipeline and metrics daily)
+  Airflow  (daily: compact Parquet → train GBT → SparkSQL aggregation)
       |
-     ML    (XGBoost intrusion classification)
+ Postgres  (network_flows + flow_submissions + daily_attack_summary)
       |
-  Postgres (network flows + predictions + metrics)
+  FastAPI  (async Kafka producer + polling endpoints)
       |
-  FastAPI  (serves real-time predictions)
-      |
- Streamlit (dashboard)
+ Streamlit (live dashboard — reads exclusively from processed data)
 ```
+
+## Data Integrity & Visualization Policy
+
+Every chart and table in the Streamlit dashboard reads exclusively from
+**processed data** — never from the raw HDFS archive (`/ids/raw`) or
+directly from raw Kafka payloads. The raw archive exists only for audit
+and replay purposes; it contains uncleaned records including duplicates,
+Infinity-derived values, and unstripped label strings that would corrupt
+any statistical visualization.
+
+The primary dashboard read path is the `daily_attack_summary` table in
+Postgres, populated daily by `analysis_queries.py` which runs SparkSQL
+queries on the cleaned, deduplicated Parquet files in `/ids/processed`.
+Because `/ids/processed` is **partitioned by `ingest_date`**, SparkSQL
+queries filtered to a single day only open that day's directory — Spark's
+partition pruning skips all other files, reducing I/O by up to 99% on a
+30-day dataset. To prevent thousands of tiny Parquet files accumulating
+from the 30-second streaming trigger, a daily Airflow compaction task
+(`compact_parquet`) coalesces each day's partition into 4 larger files
+before the training job runs, keeping scan times stable over long demos.
+
 
 ## Requirements
 
@@ -34,7 +53,7 @@ Network Flow CSVs
 
 1. **Open a terminal in the project folder:**
    ```bash
-   cd hospital-patient-flow
+   cd careflow-IDS
    ```
 
 2. **Download and put your dataset in place:**

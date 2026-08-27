@@ -1,0 +1,38 @@
+{
+  "model_version": "gbt_v1",
+  "trained_at": "2026-08-24T07:57:05.529531Z",
+  "training_duration_sec": 712.1,
+  "hdfs_model_path": "hdfs://namenode:8020/ids/models/gbt_pipeline",
+  "hdfs_data_path": "hdfs://namenode:8020/ids/processed",
+  "n_train": 4525238,
+  "n_test": 1132903,
+  "features": [
+    "protocol",
+    "flow_duration",
+    "tot_fwd_pkts",
+    "tot_bwd_pkts",
+    "totlen_fwd_pkts",
+    "totlen_bwd_pkts",
+    "flow_byts_per_s",
+    "flow_pkts_per_s",
+    "flow_iat_mean",
+    "flow_iat_std",
+    "fwd_psh_flags",
+    "fin_flag_cnt",
+    "syn_flag_cnt",
+    "rst_flag_cnt",
+    "psh_flag_cnt",
+    "ack_flag_cnt",
+    "init_fwd_win_byts",
+    "init_bwd_win_byts",
+    "active_mean",
+    "idle_mean"
+  ],
+  "metrics": {
+    "accuracy": 0.999433,
+    "f1": 0.999433,
+    "precision": 0.999433,
+    "recall": 0.999433,
+    "auc": 0.999995
+  }
+}

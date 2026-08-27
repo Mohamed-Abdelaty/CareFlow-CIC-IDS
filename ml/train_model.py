@@ -147,6 +147,174 @@ def load_from_hdfs() -> pd.DataFrame | None:
 
 
 # ---------------------------------------------------------------------------
+# Cross-Day Generalization Test Config & Helpers
+# ---------------------------------------------------------------------------
+RAW_DIR = "/data/raw"
+TRAIN_DAYS = ["02-14-2018.csv", "02-15-2018.csv", "02-16-2018.csv"]
+TEST_DAYS  = ["03-02-2018.csv"]  # Targets unseen "Bot" attacks
+
+
+def load_and_clean_raw_day(filename: str, downsample_limit: int = 50000) -> tuple[pd.DataFrame, pd.Series]:
+    """Load a raw day CSV file, apply pipeline cleaning, drop duplicates, and return df + labels.
+    Uses chunk reading and stops loading early once the target size is met to avoid Docker OOM.
+    """
+    filepath = os.path.join(RAW_DIR, filename)
+    print(f"[trainer] Loading cross-day test file: {filename}...", flush=True)
+    
+    chunks = []
+    accumulated_rows = 0
+    
+    # Read in chunks and stop as soon as we have enough unique rows to keep RAM tiny
+    for chunk in pd.read_csv(filepath, chunksize=50000, low_memory=False, 
+                             encoding="utf-8", on_bad_lines="skip"):
+        # Normalize column headers
+        chunk.columns = (
+            chunk.columns
+            .str.strip()
+            .str.lower()
+            .str.replace(r"/s$", "_per_s", regex=True)
+            .str.replace("/", "_per_", regex=False)
+            .str.replace(" ", "_", regex=False)
+            .str.replace(".", "", regex=False)
+        )
+        if "label" in chunk.columns:
+            chunk = chunk[chunk["label"].str.lower() != "label"]
+            
+        chunk = chunk.drop_duplicates()
+        chunks.append(chunk)
+        accumulated_rows += len(chunk)
+        
+        # Stop loading chunks early to stay memory-safe
+        if accumulated_rows >= downsample_limit * 1.5:
+            break
+            
+    df = pd.concat(chunks, ignore_index=True)
+    df = df.drop_duplicates()
+    
+    # Store raw label for breakdown
+    raw_labels = df["label"].str.strip() if "label" in df.columns else pd.Series(["unknown"] * len(df))
+    
+    if "label" in df.columns:
+        df["is_attack"] = (df["label"].str.strip().str.lower() != "benign").astype(int)
+        df = df.drop(columns=["label"])
+        
+    cols_to_keep = [f for f in FEATURES if f in df.columns] + ["is_attack"]
+    df = df[cols_to_keep]
+    for c in cols_to_keep:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+        
+    df = df.replace([np.inf, -np.inf], np.nan).dropna()
+    df["is_attack"] = df["is_attack"].astype(int)
+    
+    if len(df) > downsample_limit:
+        df_sampled = df.sample(n=downsample_limit, random_state=42)
+        return df_sampled, raw_labels.loc[df_sampled.index]
+        
+    return df, raw_labels.loc[df.index]
+
+
+def run_cross_day_test() -> dict | None:
+    """Run cross-day generalization test (train on DoS/BruteForce, test on Bot)."""
+    # Check if files exist
+    for f in TRAIN_DAYS + TEST_DAYS:
+        if not os.path.exists(os.path.join(RAW_DIR, f)):
+            print(f"[trainer] Cross-day CSV not found: {f}. Skipping cross-day test.", flush=True)
+            return None
+            
+    print("\n[trainer] Running Cross-Day Generalization Test...", flush=True)
+    
+    # 1. Load Train Days
+    train_frames = []
+    for f in TRAIN_DAYS:
+        df_day, _ = load_and_clean_raw_day(f)
+        train_frames.append(df_day)
+    df_train = pd.concat(train_frames, ignore_index=True)
+    
+    # 2. Load Test Days
+    test_frames = []
+    test_label_series = []
+    for f in TEST_DAYS:
+        df_day, labels_day = load_and_clean_raw_day(f)
+        test_frames.append(df_day)
+        test_label_series.append(labels_day)
+    df_test = pd.concat(test_frames, ignore_index=True)
+    labels_test = pd.concat(test_label_series, ignore_index=True)
+    
+    X_train = df_train[FEATURES]
+    y_train = df_train[TARGET]
+    X_test  = df_test[FEATURES]
+    y_test  = df_test[TARGET]
+    
+    n_benign = int((y_train == 0).sum())
+    n_attack = int((y_train == 1).sum())
+    scale_pos_weight = n_benign / n_attack if n_attack > 0 else 1.0
+    
+    pipeline = Pipeline([
+        ("scaler", StandardScaler()),
+        ("clf", XGBClassifier(
+            n_estimators=300,
+            max_depth=6,
+            learning_rate=0.1,
+            scale_pos_weight=scale_pos_weight,
+            eval_metric="logloss",
+            random_state=42,
+            n_jobs=-1,
+        )),
+    ])
+    pipeline.fit(X_train, y_train)
+    
+    y_pred = pipeline.predict(X_test)
+    y_prob = pipeline.predict_proba(X_test)[:, 1]
+    
+    acc  = accuracy_score(y_test, y_pred)
+    prec = precision_score(y_test, y_pred, zero_division=0)
+    rec  = recall_score(y_test, y_pred, zero_division=0)
+    f1   = f1_score(y_test, y_pred, zero_division=0)
+    auc  = roc_auc_score(y_test, y_prob)
+    
+    print("─" * 50)
+    print("[trainer] Cross-Day Generalization Results:")
+    print(f"  Accuracy  : {acc*100:.2f}%")
+    print(f"  Precision : {prec*100:.2f}%")
+    print(f"  Recall    : {rec*100:.2f}%")
+    print(f"  F1 Score  : {f1*100:.2f}%")
+    print(f"  ROC-AUC   : {auc*100:.2f}%")
+    print("─" * 50)
+    
+    # Save Cross-day Confusion Matrix Plot
+    cm = confusion_matrix(y_test, y_pred)
+    fig, ax = plt.subplots(figsize=(5, 4))
+    sns.heatmap(
+        cm, annot=True, fmt="d", cmap="Oranges",
+        xticklabels=["Benign", "Attack"],
+        yticklabels=["Benign", "Attack"],
+        linewidths=0.5, ax=ax,
+        annot_kws={"color": _TEXT},
+    )
+    ax.set_xlabel("Predicted Label")
+    ax.set_ylabel("True Label")
+    ax.set_title("Confusion Matrix (Cross-Day Test)")
+    _apply_dark(fig, ax)
+    fig.tight_layout()
+    
+    cross_plot_path = os.path.join(MODELS_DIR, "cross_day_confusion_matrix.png")
+    fig.savefig(cross_plot_path, dpi=150, bbox_inches="tight", facecolor=_DARK_BG)
+    plt.close(fig)
+    print(f"[trainer] Saved cross-day confusion matrix to {cross_plot_path}", flush=True)
+    
+    return {
+        "train_days": TRAIN_DAYS,
+        "test_days":  TEST_DAYS,
+        "accuracy":   round(acc,  6),
+        "precision":  round(prec, 6),
+        "recall":     round(rec,  6),
+        "f1":         round(f1,   6),
+        "auc":        round(auc,  6),
+    }
+
+
+# ---------------------------------------------------------------------------
+
 # Plot generation & metadata
 # ---------------------------------------------------------------------------
 _DARK_BG = "#1e1e2e"
@@ -364,6 +532,9 @@ def train(df: pd.DataFrame) -> None:
     # Generate evaluation plots (PNG files read by the API /model-plot endpoint)
     save_plots(y_test, y_pred, y_prob, pipeline)
 
+    # Run Cross-Day Generalization Test (if CSVs are present)
+    cross_metrics = run_cross_day_test()
+
     # Write JSON metadata (read by the API /stats and /status endpoints)
     save_metadata({
         "model_version":          "ids_classifier_v2",
@@ -383,6 +554,7 @@ def train(df: pd.DataFrame) -> None:
             "f1":        round(f1,        6),
             "auc":       round(auc,       6),
         },
+        "cross_day_metrics":      cross_metrics,
     })
 
     print(f"[trainer] All artifacts saved to {MODELS_DIR}", flush=True)

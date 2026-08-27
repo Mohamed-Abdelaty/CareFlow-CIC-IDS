@@ -18,7 +18,7 @@ from kafka.errors import NoBrokersAvailable
 KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP", "kafka:29092")
 TOPIC           = os.getenv("KAFKA_TOPIC",     "network_flows_stream")
 DATA_PATH       = os.getenv("DATA_PATH",       "/data")
-SEND_DELAY      = float(os.getenv("SEND_DELAY", "0.005"))   # seconds between messages
+SEND_DELAY      = float(os.getenv("SEND_DELAY", "0.0"))    # seconds between messages (0 = max speed)
 
 
 # ---------------------------------------------------------------------------
