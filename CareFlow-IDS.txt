@@ -1,0 +1,72 @@
+CareFlow IDS — Developer Portfolio Content
+===========================================
+
+1. Project Title:
+CareFlow IDS
+
+2. Tagline:
+Real-time distributed network intrusion detection and traffic telemetry for enterprise security operations teams.
+
+3. Overview:
+Enterprise security environments face increasingly high-velocity network attacks, yet legacy monitoring architectures struggle to ingest streaming packet data and detect malicious activity without introducing prohibitive latency. CareFlow IDS is an end-to-end distributed Big Data and machine learning platform that ingests, cleans, deduplicates, and classifies network flows in real time using Apache Kafka, Apache Spark, HDFS, and Spark MLlib. Built for Security Operations Center (SOC) teams and network engineers, the system provides sub-second threat classification, automated daily Parquet compaction and analytics via Apache Airflow, and an interactive telemetry dashboard.
+
+4. Key Features:
+- Ingest high-throughput flow telemetry via Apache Kafka and a robust ingestion producer handling 16,232,943 network records with automated header sanitization and schema normalization.
+- Filter and sanitize streaming data in real time using Spark Structured Streaming, applying 10-minute watermark-bounded deduplication and numerical validation to eliminate corrupted packet statistics.
+- Classify network threats in real time using distributed Spark MLlib Gradient-Boosted Trees (GBTClassifier) and XGBoost models, achieving a 99.94% F1-score across TCP, UDP, and ICMP protocols.
+- Automate daily pipeline maintenance through an Apache Airflow DAG that validates HDFS health, compacts streaming micro-batch Parquet files, retrains models, and refreshes SparkSQL aggregations.
+- Inspect and analyze traffic distributions using an interactive Streamlit dashboard featuring live telemetry feeds, protocol-level breakdown charts, and dark-mode operational visualizations.
+- Evaluate individual flows with sub-second response times through dedicated FastAPI endpoints that provide immediate attack probability scoring and preset threat simulations for SOC triage.
+
+5. Tech Stack:
+- Frontend / Visualization: Streamlit (1.36.0), Plotly Express & Graph Objects (5.22.0), Streamlit Autorefresh
+- Backend / API: FastAPI (0.111.0), Uvicorn (0.30.1), Pydantic (2.7.4), Python 3.11
+- Database & Storage: PostgreSQL 15 (Operational tables & Airflow metastore), Apache Hadoop HDFS 3 (NameNode & DataNode, partitioned Parquet storage)
+- ML / Data Engineering: Apache Spark 3.5.3 (Structured Streaming, SparkSQL, MLlib GBTClassifier), Apache Kafka 7.6.0 (Confluent), Apache Airflow 2.9.1 (LocalExecutor), XGBoost (2.0.3), Scikit-Learn (1.5.0), PyArrow (16.1.0), Pandas (2.2.2), NumPy (1.26.4)
+- DevOps & Infrastructure: Docker & Docker Compose (3.8), Zookeeper 7.6.0, OpenJDK 17, Bash, Git
+
+6. Architecture & Technical Highlights:
+- Unified Micro-Batch Streaming & Single-Pass Writes: Engineered a Spark Structured Streaming pipeline with a 30-second trigger and maxOffsetsPerTrigger=500000 that parses Kafka JSON, drops leakage columns, evaluates pre-trained MLlib GBT models, and writes raw Parquet, date-partitioned processed Parquet, and PostgreSQL results in a single foreachBatch execution.
+- Watermark-Bounded Deduplication & Partition Pruning: Implemented event-time watermarking (kafka_ingest_ts with a 10-minute horizon) and deduplication on flow_id to eliminate offset replay duplication across Spark streaming windows, while partitioning HDFS Parquet files by ingest_date (yyyy-MM-dd) to reduce downstream SparkSQL scan I/O by up to 99%.
+- Small-Files Compaction via Airflow Orchestration: Designed an Airflow DAG (ids_network_flow_pipeline) using LocalExecutor that executes data quality gates via the WebHDFS REST API before triggering a Spark compaction job that coalesces thousands of 30-second micro-batch Parquet files into 4 consolidated partition files, preventing NameNode metadata degradation and stabilizing query scan times.
+- Dual-Tier Serving & Low-Latency Inference: Architected a hybrid inference serving architecture in FastAPI featuring asynchronous submission via Kafka with UUID tracking in PostgreSQL (flow_submissions), paired with a sub-second local heuristic scoring engine for immediate SOC threat assessment without queuing delays.
+
+7. My Role & Contributions:
+- Architected and implemented the entire end-to-end data pipeline from scratch, containerizing 10 active services in Docker Compose across Kafka, Spark, Hadoop HDFS, Airflow, PostgreSQL, FastAPI, and Streamlit.
+- Developed the Kafka ingestion producer and Spark Structured Streaming processor, establishing schemas, type casting, numerical bounds filtering, and 10-minute watermark deduplication for 16.2 million network flows.
+- Built and tuned the machine learning classification pipelines using both Spark MLlib (GBTClassifier) and Scikit-Learn/XGBoost, conducting feature engineering across 20 flow statistics and handling class imbalance via positive-class weighting.
+- Led the diagnostic investigation and resolution of a critical data leakage defect that caused an artificial 100% training accuracy, implementing automated assertion guards, eliminating port memorization, and stripping raw label fields.
+- Created the FastAPI serving layer with 8 endpoints, integrating PostgreSQL connection pooling, health checks with time-to-live caching across 5 infrastructure components, and asynchronous task tracking.
+- Constructed the interactive Streamlit dashboard and Plotly telemetry charts, implementing live KPI metrics, protocol breakdown analytics, and a real-time flow testing playground with pre-configured attack scenarios.
+- Authored the Airflow DAG for pipeline orchestration, including WebHDFS data availability sensors, partition compaction jobs, model retraining triggers, and automated SparkSQL rollup aggregations.
+
+8. Challenges & Solutions:
+- Investigating and Eliminating Data Leakage and Duplication (100% Accuracy Root Cause Analysis):
+  * Challenge: An initial training run yielded an unrealistic 100.00% across all evaluation metrics (Accuracy, Precision, Recall, F1, ROC-AUC) on the test set.
+  * Solution: A diagnostic investigation identified three compounding root causes: (1) the trainer ran against an initial 10,000-row micro-batch with extreme class imbalance (96 benign vs. 9,950 attack), allowing XGBoost to separate classes using a single threshold on flow_duration (100% feature importance); (2) Spark Structured Streaming wrote raw offsets with mode("append") without deduplication, resulting in 30.9% duplicate rows (426,379 of 1,380,249) that spanned the 80/20 train/test split boundary; (3) the raw label string was written alongside is_attack, and dst_port allowed the model to memorize fixed attack ports. I resolved this by implementing in-stream deduplication on flow_id in Spark, adding pre-split deduplication in the trainer, dropping raw label and dst_port, and enforcing a strict _LEAKAGE_COLS assertion guard. Post-fix training achieved a verified 99.94% F1-score with balanced feature gains (dominant init_fwd_win_byts at 87%).
+
+- Mitigating the HDFS Small-Files Problem from Continuous Streaming:
+  * Challenge: The 30-second Spark Structured Streaming trigger interval generated thousands of tiny Parquet files across HDFS partitions over multi-hour runs, threatening NameNode memory exhaustion and slowing downstream daily batch training.
+  * Solution: Developed an automated compaction task (compact_parquet) within the Apache Airflow DAG. Before running model training or analytics rollups, the task inspects partition file counts via HDFS CLI commands. If the count exceeds the threshold, it executes a Spark compaction job that reads the daily partition (ingest_date=YYYY-MM-DD) and overwrites it coalesced down to 4 balanced Parquet files (df.coalesce(4)), maintaining steady I/O throughput and clean HDFS metadata state.
+
+- Resource Contention and Memory Allocation on a Single Host:
+  * Challenge: Running Kafka, Zookeeper, HDFS NameNode/DataNode, Spark Master/Worker/Processor, Airflow Webserver/Scheduler, PostgreSQL, FastAPI, and Streamlit concurrently within an 8 GB RAM Docker environment caused resource starvation and JVM crashes during simultaneous streaming and training.
+  * Solution: Tuned Spark memory fractions (spark.memory.fraction=0.8, 2 GB driver/executor allocations, 4-8 shuffle partitions), decoupled batch model training into standalone spark-submit executions using local[2] worker configurations, implemented 10-30s TTL caching on health check endpoints in FastAPI, and introduced early-exit caching in analysis_queries.py and train_gbt_model.py to skip redundant scans when PostgreSQL already holds up-to-date metrics.
+
+9. Results & Impact:
+- 16,232,943 raw network flows ingested across 10 CSE-CIC-IDS2018 CSV files (~6.8 GB raw data) into Kafka without data loss.
+- 5,660,346 unique, validated flows retained after multi-stage data cleaning (filtering nulls, infinite byte/packet rates, and duplicate IDs).
+- 99.94% Accuracy, 99.94% Precision, 99.94% Recall, 99.94% F1-Score, and 99.9995% ROC-AUC achieved by the Spark MLlib GBTClassifier on a held-out test set of 1,132,903 flows (4,525,238 training flows).
+- 712.1 seconds (~11.8 minutes) distributed model training duration on Spark for 5.66 million records.
+- 99.99% Accuracy, 99.98% Precision, 99.96% Recall, and 99.97% F1-Score achieved by the Scikit-Learn/XGBoost model pipeline (trained on 863,719 rows, tested on 215,930 rows) in 78.4 seconds.
+- Up to 99% I/O reduction on single-day analytical queries via Spark partition pruning across date-partitioned HDFS directories (/ids/processed/ingest_date=YYYY-MM-DD).
+- 8 REST API endpoints implemented in FastAPI covering async flow submission, health monitoring, system statistics, and sub-second heuristic scoring.
+- 10 active containerized services orchestrated via Docker Compose on a single bridge network with persistent volume storage.
+- 4 automated tasks orchestrated in an Apache Airflow DAG (ids_network_flow_pipeline) ensuring verified data quality, compaction, model fitting, and SQL aggregation.
+- 3 core network protocols monitored (ICMP, TCP, UDP) with granular per-protocol attack breakdown.
+
+10. Short Version:
+CareFlow IDS is an enterprise-grade distributed network intrusion detection system built on Apache Kafka, Apache Spark, HDFS, and FastAPI. Processing over 16.2 million network flows from the CSE-CIC-IDS2018 dataset, it combines real-time streaming cleaning, watermark-based deduplication, and distributed GBTClassifier inference achieving 99.94% F1-score. An Airflow-orchestrated pipeline automates daily Parquet compaction and SparkSQL analytics, while an interactive Streamlit dashboard delivers sub-second threat classification and network telemetry for security operations teams.
+
+11. Links:
+- [GitHub Repo]
